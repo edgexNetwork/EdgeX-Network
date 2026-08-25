@@ -1,4 +1,4 @@
-import { sha256 } from '@edgex/shared';
+import { sha256, TARGET_BLOCK_SECONDS } from '@edgex/shared';
 
 /** A verifier both recomputes the PoW and checks it against consensus target. */
 export interface PowVerifier {
@@ -46,4 +46,13 @@ function bytesToHexLocal(bytes: Uint8Array): string {
 export function workForDifficulty(difficulty: bigint): bigint {
   if (difficulty < 1n) throw new RangeError('difficulty must be positive');
   return MAX_TARGET / difficulty + 1n;
+}
+
+/**
+ * Estimate nominal network hash rate from difficulty and the target block period.
+ * This is a display metric only; it does not participate in consensus validation.
+ */
+export function estimateNetworkHashps(difficulty: bigint): number {
+  if (difficulty < 1n) throw new RangeError('difficulty must be positive');
+  return Math.max(0, Math.round(Number(difficulty) / Number(TARGET_BLOCK_SECONDS)));
 }

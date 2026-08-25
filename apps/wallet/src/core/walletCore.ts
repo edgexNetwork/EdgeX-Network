@@ -28,6 +28,12 @@ export interface SendOptions {
   tier?: string | null;
 }
 
+export interface MiningInfo {
+  difficulty: string;
+  networkHashps: number;
+  hashrate: number;
+}
+
 export class WalletCore {
   readonly bus = new EventBus();
   readonly chain = new ChainState();
@@ -137,7 +143,7 @@ export class WalletCore {
       phase: phaseForHeight(Math.max(1, height + 1)),
       currentReward: formatEdxAmount(reward),
       totalIssued: String(info.totalIssued ?? "0"),
-      networkPower: Number(info.networkPower ?? 0),
+      networkPower: Number(info.networkPower ?? info.networkHashps ?? 0),
       pendingCount: Number(info.mempoolSize ?? 0),
       connectedNodes: this.conn.connectedCount,
     });
@@ -286,6 +292,32 @@ export class WalletCore {
 
   getConnectionCount(): number {
     return this.conn.connectedCount;
+  }
+
+  async getMiningInfo(): Promise<MiningInfo> {
+    const info = await this.conn.request<Record<string, unknown>>("GET", "/chain/info");
+    return {
+      difficulty: String(info.difficulty ?? "0"),
+      networkHashps: Number(info.networkHashps ?? info.networkPower ?? 0),
+      hashrate: 0,
+    };
+  }
+
+  async getMiningJob(): Promise<Record<string, unknown>> {
+    const job = await this.conn.request<Record<string, unknown>>("POST", "/mining/template", {
+      address: this.key.address,
+    });
+    const block = job.block as { header?: { previousHash?: string } } | undefined;
+    return {
+      jobId: job.jobId,
+      height: job.height,
+      previousblockhash: block?.header?.previousHash,
+      blob: job.blobHex,
+      seedHash: job.seedHash,
+      target: job.targetHex,
+      difficulty: job.difficulty,
+      coinbasevalue: this.chain.blockReward,
+    };
   }
 
   getBlockCount(): number {

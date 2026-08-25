@@ -31,6 +31,9 @@ describe("node wallet service", () => {
 
   test("exposes pending transfers before confirmation, matching the legacy wallet history", () => {
     const service = new ChainService(new AcceptedVerifier(), store, "test-network");
+    const initialInfo = service.info();
+    expect(initialInfo.networkHashps).toBe(66_667);
+    expect(initialInfo.networkPower).toBe(66_667);
     const { privateKeyHex, publicKeyHex } = generateKeyPair();
     const sender = addressFromPublicKey(publicKeyHex);
     const recipient = addressFromPublicKey(generateKeyPair().publicKeyHex);

@@ -20,6 +20,7 @@ import {
   serializeMiningBlob,
   targetForDifficulty,
   workForDifficulty,
+  estimateNetworkHashps,
 } from '@edgex/core';
 import type { Block, PowVerifier } from '@edgex/core';
 import { BlockchainStore } from './storage';
@@ -62,7 +63,11 @@ export class ChainService {
   readonly mempool = new TransactionMempool();
   onTransactionAccepted?: ((transaction: SignedTransaction) => void) | undefined;
   onBlockAccepted?: ((block: Block) => void) | undefined;
-  peerStatus?: (() => { connected: number; total: number }) | undefined;
+  peerStatus?: (() => {
+    connected: number;
+    total: number;
+    items?: Array<{ address: string; connected: boolean; source: string }>;
+  }) | undefined;
   private jobs = new Map<string, MiningJob>();
 
   constructor(
@@ -79,6 +84,7 @@ export class ChainService {
   }
 
   info() {
+    const next = this.chain.nextConsensusData();
     return {
       networkId: this.networkId,
       genesisHash: GENESIS_HASH,
@@ -87,6 +93,9 @@ export class ChainService {
       totalIssued: formatEdxAmount(this.chain.totalIssued),
       mempoolSize: this.mempool.size,
       lastBlockTime: this.chain.get(this.chain.bestBlockHash).block.header.timestampSeconds,
+      difficulty: next.difficulty.toString(),
+      networkHashps: estimateNetworkHashps(next.difficulty),
+      networkPower: estimateNetworkHashps(next.difficulty),
     };
   }
 
@@ -334,7 +343,13 @@ export class ChainService {
     return {
       connected: status.connected,
       total: status.total,
-      items: [{
+      items: status.items?.map((item, index) => ({
+        id: index + 1,
+        address: item.address,
+        connected: item.connected,
+        latencyMs: null,
+        source: item.source,
+      })) ?? [{
         id: 1,
         address: 'local-full-node',
         connected: true,

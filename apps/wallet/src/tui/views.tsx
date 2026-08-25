@@ -916,6 +916,7 @@ function networkView(snap: ViewSnapshot, actions: ViewActions): ViewResult {
   const regions: Region[] = [];
   rows.push(sectionHeader(t("network.title")));
   rows.push({ text: t("network.p2p", { a: snap.connectedNodes, b: snap.totalNodes }), color: snap.connectedNodes > 0 ? C.fg : C.red, bold: true });
+  rows.push({ text: t("network.hashrate", { hashrate: formatNumber(snap.chain?.networkPower ?? 0) }), color: C.gray });
   rows.push({ text: snap.selfP2pUrl ? t("network.self", { url: snap.selfP2pUrl }) : t("network.selfHidden"), color: C.cyan });
   rows.push({ text: t("network.list"), color: C.gray });
   for (const line of snap.peersText.split("\n")) rows.push({ text: `  ${line}`, color: C.gray });

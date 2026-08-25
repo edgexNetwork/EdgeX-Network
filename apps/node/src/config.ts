@@ -12,6 +12,7 @@ export interface NodeConfig {
   allowTestPow: boolean;
   randomXLibrary?: string | undefined;
   seeds: string[];
+  publicUrl?: string | undefined;
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {
@@ -31,6 +32,7 @@ export function loadNodeConfig(environment: NodeJS.ProcessEnv = process.env): No
     nativeRandomX: environment.EDX_RANDOMX_NATIVE === '1',
     allowTestPow: environment.EDX_ALLOW_TEST_POW === '1',
     randomXLibrary: environment.EDX_RANDOMX_LIBRARY,
+    publicUrl: environment.EDX_PUBLIC_URL?.trim() || undefined,
     seeds: (environment.EDX_SEEDS ?? '')
       .split(',')
       .map((seed) => seed.trim())

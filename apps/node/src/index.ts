@@ -40,6 +40,7 @@ async function main(): Promise<void> {
         // Invalid peer blocks are rejected without disconnecting the peer.
       }
     },
+    config.publicUrl,
   );
   service.onTransactionAccepted = (transaction) => {
     network.broadcast({ type: 'transaction', transaction });
@@ -59,7 +60,14 @@ async function main(): Promise<void> {
   });
   network.start(config.seeds);
 
-  service.peerStatus = () => ({ connected: network.peerCount, total: network.peerCount });
+  service.peerStatus = () => {
+    const peers = network.knownPeerUrls();
+    return {
+      connected: network.peerCount,
+      total: peers.length,
+      items: peers.map((address) => ({ address, connected: true, source: 'p2p' })),
+    };
+  };
 
   rpc.start();
 

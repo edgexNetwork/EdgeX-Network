@@ -42,6 +42,7 @@ export function builtinCommands(): Command[] {
           t("cmd.info.network", { ticker: COIN_TICKER, connected: info.connectedNodes, total: ctx.core.getPeers().length }),
           t("cmd.info.height", { blocks: formatNumber(info.blocks), backend: formatNumber(info.backendHeight), pct: (info.syncProgress * 100).toFixed(1) }),
           t("cmd.info.phase", { phase: info.phase, reward: trimEDX(info.blockReward), ticker: COIN_TICKER, supply: trimEDX(info.supply) }),
+          t("cmd.info.hashrate", { hashrate: formatNumber(info.networkPower) }),
         ].join("\n");
       },
     },

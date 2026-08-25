@@ -27,6 +27,7 @@ import { App } from "./tui/App";
 import { Onboarding } from "./tui/Onboarding";
 import { warnAndPromptTuiEnv } from "./tui/envCheck";
 import { applyStoredLang, currentLocale, t } from "./i18n";
+import { startWalletRpc } from "./rpc/lifecycle";
 
 const VERSION = "1.0.0";
 
@@ -153,9 +154,11 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
   else log.info(message);
 
   const { core, registry } = buildServices(config, key, log);
+  const rpc = startWalletRpc(config, core, log);
   try {
     await core.start();
   } catch (error) {
+    rpc?.stop();
     console.error(`Startup failed: ${(error as Error).message}`);
     process.exit(1);
   }
@@ -164,6 +167,7 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
   const exit = () => {
     if (exiting) return;
     exiting = true;
+    rpc?.stop();
     void core.stop().finally(() => process.exit(0));
   };
   core.bus.on("shutdown", exit);

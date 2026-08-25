@@ -10,7 +10,8 @@ export type P2PRpcHandler = (
 ) => Promise<{ status: number; data: unknown }>;
 
 type PeerMessage =
-  | { type: 'hello'; nodeId: string; networkId: string; height: number; bestHash: string }
+  | { type: 'hello'; nodeId: string; networkId: string; height: number; bestHash: string; advertisedUrl?: string }
+  | { type: 'peers'; peers: unknown }
   | { type: 'transaction'; transaction: SignedTransaction }
   | { type: 'block'; block: Block }
   | { type: 'rpc_request'; id: string; method: 'GET' | 'POST'; path: string; body?: unknown }
@@ -19,9 +20,18 @@ type PeerMessage =
 interface PeerState {
   nodeId?: string;
   networkId?: string;
+  advertisedUrl?: string;
   rpcTokens?: number;
   rpcRefilledAt?: number;
   activeRpcRequests?: number;
+}
+
+interface OutboundPeer {
+  url: string;
+  socket?: WebSocket | undefined;
+  attempts: number;
+  timer?: ReturnType<typeof setTimeout> | undefined;
+  advertisedUrl?: string | undefined;
 }
 
 interface PendingRpc {
@@ -30,13 +40,29 @@ interface PendingRpc {
   timer: ReturnType<typeof setTimeout>;
 }
 
-/** Small authenticated-by-consensus gossip surface; peers gain trust only through valid blocks. */
+export interface OutboundPeerSnapshot {
+  url: string;
+  connected: boolean;
+  attempts: number;
+  reconnecting: boolean;
+}
+
+const MAX_PEERS = 128;
+const MAX_ADVERTISED_PEERS = 32;
+const MAX_PEER_ANNOUNCEMENTS = 64;
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_MAX_MS = 30_000;
+
+/** Consensus-authenticated gossip surface; peer trust comes only from valid blocks. */
 export class P2PNetwork {
-  private readonly peers = new Set<ServerWebSocket<PeerState>>();
-  private readonly outboundPeers = new Set<WebSocket>();
+  private readonly inbound = new Set<ServerWebSocket<PeerState>>();
+  private readonly outbound = new Map<string, OutboundPeer>();
+  private readonly outboundSocketEntries = new WeakMap<WebSocket, OutboundPeer>();
+  private readonly outboundPending = new WeakMap<WebSocket, Map<string, PendingRpc>>();
   private server?: ReturnType<typeof Bun.serve<PeerState>>;
   private rpcHandler?: P2PRpcHandler | undefined;
-  private readonly outboundPending = new WeakMap<WebSocket, Map<string, PendingRpc>>();
+  private stopped = false;
+  private selfUrl: string | undefined;
 
   /** Install the loopback-equivalent public API handler used by wallet peers. */
   setRpcHandler(handler: P2PRpcHandler): void {
@@ -49,9 +75,19 @@ export class P2PNetwork {
     private readonly status: () => { height: number; bestHash: string },
     private readonly onTransaction: (transaction: SignedTransaction) => void,
     private readonly onBlock: (block: Block) => void,
-  ) {}
+    private readonly publicUrl?: string | undefined,
+    private readonly webSocketFactory: (url: string) => WebSocket = (url) => new WebSocket(url),
+  ) {
+    this.selfUrl = normalizePeerUrl(publicUrl ?? '');
+  }
+
+  /** Set the externally reachable address after an ephemeral port is bound. */
+  setPublicUrl(url: string): void {
+    this.selfUrl = normalizePeerUrl(url);
+  }
 
   start(seeds: readonly string[]): void {
+    this.stopped = false;
     this.server = Bun.serve<PeerState>({
       port: this.port,
       fetch: (request, server) => {
@@ -61,56 +97,88 @@ export class P2PNetwork {
       websocket: {
         open: (socket) => {
           socket.data = {};
-          this.peers.add(socket);
+          this.inbound.add(socket);
           socket.send(JSON.stringify(this.hello()));
         },
-        message: (socket, message) => this.handle(socket, message),
+        message: (socket, message) => this.handleInbound(socket, message),
         close: (socket) => {
-          this.peers.delete(socket);
+          this.inbound.delete(socket);
         },
       },
     });
 
-    for (const seed of seeds.slice(0, 16)) void this.connect(seed);
+    for (const seed of seeds.slice(0, MAX_PEERS)) this.connect(seed);
   }
 
-  async connect(url: string): Promise<void> {
-    if (!/^wss?:\/\//.test(url) || this.peerCount > 128) return;
-    const socket = new WebSocket(url);
-    socket.addEventListener('open', () => {
-      this.outboundPeers.add(socket);
-      socket.send(JSON.stringify(this.hello()));
-    });
-    socket.addEventListener('close', () => this.outboundPeers.delete(socket));
-    socket.addEventListener('message', (event) => {
-      handleMessage(event.data as string, (message: PeerMessage) => {
-        if (message.type === 'transaction') this.onTransaction(message.transaction);
-        if (message.type === 'block') this.onBlock(message.block);
-        if (message.type === 'rpc_result') this.resolveOutbound(socket, message);
-      });
-    });
+  /** Connect (or schedule a connection) to a validated WebSocket peer URL. */
+  connect(url: string): void {
+    const normalized = normalizePeerUrl(url);
+    if (!normalized || normalized === this.selfUrl || this.outbound.has(normalized)) return;
+    if (this.outbound.size >= MAX_PEERS) return;
+
+    const peer: OutboundPeer = { url: normalized, attempts: 0 };
+    this.outbound.set(normalized, peer);
+    this.scheduleConnect(peer, 0);
   }
 
   broadcast(message: PeerMessage): void {
     const payload = JSON.stringify(message);
-    for (const peer of this.peers) peer.send(payload);
-    for (const peer of this.outboundPeers) {
+    for (const peer of this.inbound) {
       if (peer.readyState === WebSocket.OPEN) peer.send(payload);
+    }
+    for (const peer of this.outbound.values()) {
+      if (peer.socket?.readyState === WebSocket.OPEN) peer.socket.send(payload);
     }
   }
 
   get peerCount(): number {
-    return this.peers.size;
+    let count = this.inbound.size;
+    for (const peer of this.outbound.values()) {
+      if (peer.socket?.readyState === WebSocket.OPEN) count += 1;
+    }
+    return count;
   }
 
   get boundPort(): number | undefined {
     return this.server?.port;
   }
 
+  knownPeerUrls(excludeUrl?: string): string[] {
+    const excluded = normalizePeerUrl(excludeUrl ?? '');
+    const urls = new Set<string>();
+    if (this.selfUrl && this.selfUrl !== excluded) urls.add(this.selfUrl);
+    for (const socket of this.inbound) {
+      const url = normalizePeerUrl(socket.data.advertisedUrl ?? '');
+      if (url && url !== excluded) urls.add(url);
+    }
+    for (const peer of this.outbound.values()) {
+      if (peer.socket?.readyState !== WebSocket.OPEN || peer.url === excluded) continue;
+      urls.add(normalizePeerUrl(peer.advertisedUrl ?? '') || peer.url);
+    }
+    return [...urls].slice(0, MAX_ADVERTISED_PEERS);
+  }
+
+  outboundSnapshot(): OutboundPeerSnapshot[] {
+    return [...this.outbound.values()].map((peer) => ({
+      url: peer.url,
+      connected: peer.socket?.readyState === WebSocket.OPEN,
+      attempts: peer.attempts,
+      reconnecting: !peer.socket && peer.timer !== undefined,
+    }));
+  }
+
   stop(): void {
+    this.stopped = true;
+    for (const peer of this.outbound.values()) {
+      if (peer.timer) clearTimeout(peer.timer);
+      peer.timer = undefined;
+      peer.socket?.close();
+    }
+    for (const socket of this.inbound) socket.close();
+    this.outbound.clear();
+    this.inbound.clear();
     this.server?.stop(true);
-    this.peers.clear();
-    this.outboundPeers.clear();
+    this.server = undefined;
   }
 
   private hello(): PeerMessage {
@@ -120,24 +188,128 @@ export class P2PNetwork {
       networkId: NETWORK_ID,
       height: this.status().height,
       bestHash: this.status().bestHash,
+      ...(this.selfUrl ? { advertisedUrl: this.selfUrl } : {}),
     };
   }
 
-  private handle(socket: ServerWebSocket<PeerState>, raw: string | ArrayBuffer | Uint8Array): void {
-    if (typeof raw !== 'string') return;
-    handleMessage(raw, (message: PeerMessage) => {
-      if (message.type === 'hello') {
-        if (message.networkId !== NETWORK_ID || !/^[\w:-]{8,80}$/.test(message.nodeId)) {
-          socket.close();
-          return;
-        }
-        socket.data.nodeId = message.nodeId;
-        socket.data.networkId = message.networkId;
+  private scheduleConnect(peer: OutboundPeer, delayMs: number): void {
+    if (this.stopped) return;
+    if (peer.timer) clearTimeout(peer.timer);
+    peer.timer = setTimeout(() => void this.openOutbound(peer), delayMs);
+  }
+
+  private async openOutbound(peer: OutboundPeer): Promise<void> {
+    if (this.stopped || peer.socket || this.outbound.get(peer.url) !== peer) return;
+    peer.timer = undefined;
+    peer.attempts += 1;
+
+    let socket: WebSocket;
+    try {
+      socket = this.webSocketFactory(peer.url);
+    } catch {
+      this.scheduleReconnect(peer);
+      return;
+    }
+    this.outboundSocketEntries.set(socket, peer);
+
+    socket.addEventListener('open', () => {
+      if (this.stopped || this.outbound.get(peer.url) !== peer) {
+        socket.close();
+        return;
       }
-      if (message.type === 'transaction') this.onTransaction(message.transaction);
-      if (message.type === 'block') this.onBlock(message.block);
-      if (message.type === 'rpc_request') void this.handleRpcRequest(socket, message);
+      peer.socket = socket;
+      peer.attempts = 0;
+      socket.send(JSON.stringify(this.hello()));
     });
+
+    socket.addEventListener('message', (event) => {
+      this.handleOutboundMessage(peer, socket, event.data);
+    });
+
+    socket.addEventListener('close', () => {
+      this.rejectPending(socket, new Error(`P2P peer disconnected: ${peer.url}`));
+      if (peer.socket !== socket && this.outboundSocketEntries.get(socket) !== peer) return;
+      peer.socket = undefined;
+      peer.advertisedUrl = undefined;
+      if (!this.stopped && this.outbound.get(peer.url) === peer) {
+        this.scheduleConnect(peer, reconnectDelayMs(peer.attempts));
+      }
+    });
+  }
+
+  private scheduleReconnect(peer: OutboundPeer): void {
+    if (!this.stopped && this.outbound.get(peer.url) === peer) {
+      this.scheduleConnect(peer, reconnectDelayMs(peer.attempts));
+    }
+  }
+
+  private handleInbound(socket: ServerWebSocket<PeerState>, raw: string | ArrayBuffer | Uint8Array): void {
+    const message = parsePeerMessage(raw);
+    if (!message) return;
+
+    if (message.type === 'hello') {
+      // An invalid handshake permanently closes this inbound connection.
+      if (!this.acceptHello(socket, message)) socket.close();
+      else socket.send(JSON.stringify({
+        type: 'peers',
+        peers: this.knownPeerUrls(message.advertisedUrl),
+      }));
+      return;
+    }
+    if (message.type === 'peers') {
+      this.addDiscoveredPeers(message.peers);
+      return;
+    }
+    if (message.type === 'rpc_request') void this.handleRpcRequest(socket, message);
+    else this.handleCommonMessage(message);
+  }
+
+  private handleOutboundMessage(
+    peer: OutboundPeer,
+    socket: WebSocket,
+    raw: string | ArrayBuffer | Uint8Array,
+  ): void {
+    const message = parsePeerMessage(raw);
+    if (!message) return;
+
+    if (message.type === 'hello') {
+      if (!this.acceptHello(socket, message, peer)) this.forgetPeer(peer, socket);
+      return;
+    }
+    if (message.type === 'peers') {
+      this.addDiscoveredPeers(message.peers);
+      return;
+    }
+    if (message.type === 'rpc_result') {
+      this.resolveOutbound(socket, message);
+      return;
+    }
+    this.handleCommonMessage(message);
+  }
+
+  private acceptHello(
+    socket: WebSocket | ServerWebSocket<PeerState>,
+    message: Extract<PeerMessage, { type: 'hello' }>,
+    outboundPeer?: OutboundPeer,
+  ): boolean {
+    if (message.networkId !== NETWORK_ID || !/^[\w:-]{8,80}$/.test(message.nodeId)) return false;
+    const advertisedUrl = normalizePeerUrl(message.advertisedUrl ?? '');
+    if (message.advertisedUrl && !advertisedUrl) return false;
+
+    if (outboundPeer) {
+      outboundPeer.advertisedUrl = advertisedUrl || undefined;
+    } else {
+      const inbound = socket as ServerWebSocket<PeerState>;
+      inbound.data.nodeId = message.nodeId;
+      inbound.data.networkId = message.networkId;
+      inbound.data.advertisedUrl = advertisedUrl || undefined;
+    }
+
+    socket.send(JSON.stringify({
+      type: 'peers',
+      peers: this.knownPeerUrls(outboundPeer ? outboundPeer.url : advertisedUrl),
+    }));
+    return true;
   }
 
   private async handleRpcRequest(
@@ -146,7 +318,13 @@ export class P2PNetwork {
   ): Promise<void> {
     const reply = (status: number, data: unknown, error?: string) => {
       if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify({ type: 'rpc_result', id: message.id, status, data, ...(error ? { error } : {}) }));
+      socket.send(JSON.stringify({
+        type: 'rpc_result',
+        id: message.id,
+        status,
+        data,
+        ...(error ? { error } : {}),
+      }));
     };
 
     if (!this.rpcHandler || !isValidRpcId(message.id) || !isValidRpcPath(message.path)) {
@@ -173,6 +351,26 @@ export class P2PNetwork {
     }
   }
 
+  private handleCommonMessage(message: PeerMessage): void {
+    if (message.type === 'transaction') this.onTransaction(message.transaction);
+    if (message.type === 'block') this.onBlock(message.block);
+  }
+
+  private addDiscoveredPeers(value: unknown): void {
+    if (!Array.isArray(value)) return;
+    for (const item of value.slice(0, MAX_PEER_ANNOUNCEMENTS)) {
+      if (typeof item === 'string') this.connect(item);
+    }
+  }
+
+  private forgetPeer(peer: OutboundPeer, socket: WebSocket): void {
+    peer.timer = undefined;
+    peer.socket = undefined;
+    if (this.outbound.get(peer.url) === peer) this.outbound.delete(peer.url);
+    this.rejectPending(socket, new Error('invalid P2P handshake'));
+    socket.close();
+  }
+
   private resolveOutbound(
     socket: WebSocket,
     message: Extract<PeerMessage, { type: 'rpc_result' }>,
@@ -184,17 +382,54 @@ export class P2PNetwork {
     if (typeof message.status === 'number') pending.resolve({ status: message.status, data: message.data });
     else pending.reject(new Error(message.error ?? 'invalid P2P RPC response'));
   }
+
+  private rejectPending(socket: WebSocket, error: Error): void {
+    const pending = this.outboundPending.get(socket);
+    if (!pending) return;
+    for (const request of pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+    pending.clear();
+  }
 }
 
-function handleMessage(raw: string, handler: (message: PeerMessage) => void): void {
-  if (raw.length > 3_000_000) return;
+export function reconnectDelayMs(attempts: number): number {
+  const exponent = Math.max(0, Math.min(5, attempts - 1));
+  return Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** exponent);
+}
+
+function normalizePeerUrl(value: string | undefined): string | undefined {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 2_048) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'ws:' && url.protocol !== 'wss:') return undefined;
+    const pathname = url.pathname.replace(/\/$/, '');
+    if (pathname !== '' && pathname !== '/p2p') return undefined;
+    if (url.search || url.hash) return undefined;
+    url.pathname = '/p2p';
+    url.search = '';
+    url.hash = '';
+    const normalized = url.toString().replace(/\/$/, '');
+    return /^wss?:\/\/[\w.:\[\]-]+\/p2p$/i.test(normalized) ? normalized : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parsePeerMessage(raw: string | ArrayBuffer | Uint8Array): PeerMessage | null {
+  if (typeof raw !== 'string' || raw.length > 3_000_000) return null;
   try {
     const value = JSON.parse(raw) as PeerMessage;
-    if (value.type !== 'hello' && value.type !== 'transaction' && value.type !== 'block' &&
-        value.type !== 'rpc_request' && value.type !== 'rpc_result') return;
-    handler(value);
+    if (
+      typeof value !== 'object' || value === null ||
+      !['hello', 'peers', 'transaction', 'block', 'rpc_request', 'rpc_result'].includes(value.type)
+    ) {
+      return null;
+    }
+    return value;
   } catch {
-    // Malformed gossip is silently discarded after rate limiting at the transport layer.
+    return null;
   }
 }
 

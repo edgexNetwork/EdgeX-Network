@@ -13,6 +13,7 @@ import {
   ConsensusChain,
   GENESIS_BLOCK,
   calculateMerkleRoot,
+  estimateNetworkHashps,
   expectedSeedHeight,
   nextLwmaDifficulty,
   readNonce,
@@ -129,6 +130,11 @@ describe('difficulty and RandomX schedule', () => {
     expect(expectedSeedHeight(1)).toBe(0);
     expect(expectedSeedHeight(2049)).toBe(1984);
     expect(nextLwmaDifficulty([])).toBe(1_000_000n);
+  });
+
+  test('estimates display-only network hash rate from difficulty', () => {
+    expect(estimateNetworkHashps(900_000n)).toBe(60_000);
+    expect(() => estimateNetworkHashps(0n)).toThrow(RangeError);
   });
 });
 

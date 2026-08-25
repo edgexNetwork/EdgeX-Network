@@ -108,7 +108,16 @@ export class RpcServer {
         const address = String(body.address ?? '');
         if (!validateAddress(address)) return error('invalid payout address');
         const job = this.options.service.createJob(address);
-        return json({ algorithm: STRATUM_ALGORITHM, ...job });
+        return json({
+          algorithm: STRATUM_ALGORITHM,
+          jobId: job.jobId,
+          blobHex: job.blobHex,
+          seedHash: job.seedHash,
+          targetHex: job.targetHex,
+          height: job.height,
+          difficulty: job.difficulty.toString(),
+          block: job.block,
+        });
       }
       if (url.pathname === '/mining/submit') {
         const jobId = String(body.jobId ?? '');
