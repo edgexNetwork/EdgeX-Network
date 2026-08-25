@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.*
+data/
+*.sqlite
+*.sqlite-*
+wallet.dat
+wallet.vault
+
+# RandomX native build products are never committed through the main repository.
+vendor/RandomX/build/

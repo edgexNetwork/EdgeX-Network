@@ -1,0 +1,13 @@
+{
+  "name": "@edgex/node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "edgex-node": "./src/index.ts"
+  },
+  "dependencies": {
+    "@edgex/core": "workspace:*",
+    "@edgex/shared": "workspace:*"
+  }
+}

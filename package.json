@@ -1,0 +1,30 @@
+{
+  "name": "edgex-decentralized",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.0.0",
+    "@noble/curves": "^2.0.0",
+    "@noble/hashes": "^2.0.0",
+    "@scure/bip32": "^1.6.0",
+    "@scure/bip39": "^1.5.0",
+    "ink": "^5.0.0",
+    "qrcode": "^1.5.4",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^18.3.0",
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.7.0"
+  }
+}

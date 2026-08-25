@@ -1,0 +1,16 @@
+{
+  "name": "@edgex/wallet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "edgex-wallet": "./src/index.tsx"
+  },
+  "dependencies": {
+    "@edgex/shared": "workspace:*",
+    "@edgex/core": "workspace:*",
+    "ink": "^5.0.0",
+    "qrcode": "^1.5.4",
+    "react": "^18.3.1"
+  }
+}
