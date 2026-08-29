@@ -1,4 +1,5 @@
 # EdgeX Network — Technical Whitepaper
+![EdgeX Network Banner](https://www.edgexnetwork.org/streamer.png)
 
 **Version**: v1.0.0
 
