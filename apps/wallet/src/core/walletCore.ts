@@ -272,6 +272,55 @@ export class WalletCore {
     return firstTxid!;
   }
 
+  /**
+   * 构建并签名一笔游戏小费交易（自动签名免确认路径，供本地游戏网关使用）：
+   * 与 send() 同一套选币/签名机制（FIFO 选输入 + 按体积计费 + 找零），但只返回已签名交易，
+   * 直接广播上链、无交互确认——安全边界靠游戏网关钳制单笔上限（gamefee）与每日累计上限（gamefeeperday）。
+   * 密码校验：显式 password（TUI 解锁后内存持有 / daemon 的 EDX_WALLET_PASSWORD），缺失时抛错。
+   */
+  async buildGameFeeTx(payments: PaymentInput[], password?: string): Promise<SignedTransaction> {
+    if (!this.chain.isSynced()) {
+      throw walletError(
+        RPC_CODE.GENERIC,
+        "Blockchain sync in progress; game uploads are disabled until fully synced",
+      );
+    }
+    if (this.requirePassword()) {
+      if (!password) {
+        throw walletError(
+          RPC_CODE.GENERIC,
+          "Wallet locked: game uploads need the wallet password (provide password or unlock first)",
+        );
+      }
+      const unlocked = loadWalletKey(this.config.datadir, password);
+      if (unlocked.address !== this.key.address) throw walletError(RPC_CODE.GENERIC, "Wrong wallet password; game upload rejected");
+    }
+
+    const fee = resolveFee(await this.getFees(), {});
+    const normalizedPayments = normalizePayments(payments, this.key.address);
+    const utxos = (await this.conn
+      .request<{ items: UtxoDTO[] }>("GET", `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`)
+      .then((result) => result.items)).filter((utxo) => utxo.spendable);
+
+    // 小费金额极小，单笔转账即可覆盖（planSplitTransfer 保证 payments 非空时至少一个 chunk）
+    const chunk = planSplitTransfer(utxos, normalizedPayments, fee.fee)[0]!;
+    const outputs = chunk.outputs.map((output) => ({
+      address: output.address,
+      amount: formatEdxAmount(output.amountPhotons),
+    }));
+    if (chunk.change > 0n) {
+      outputs.push({ address: this.key.address, amount: formatEdxAmount(chunk.change) });
+    }
+    return signTransaction(
+      {
+        inputs: chunk.utxos.map((utxo) => ({ txid: utxo.txid, index: utxo.index })),
+        outputs,
+        fee: formatEdxAmount(fee.fee),
+      },
+      Buffer.from(this.key.privateKey).toString("hex"),
+    );
+  }
+
   async listTransactions(limit = 20): Promise<TxView[]> {
     return this.conn.request<TxView[]>("GET", `/wallet/history?address=${encodeURIComponent(this.key.address)}&limit=${limit}`);
   }

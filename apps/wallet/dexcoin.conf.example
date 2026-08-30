@@ -1,0 +1,51 @@
+# EdgeX Network 钱包配置示例（bitcoin.conf 风格）
+server=1
+rpcuser=edx
+rpcpassword=edx-secret
+rpcport=18332
+
+# P2P 监听（listen=1 时公开本节点端口，供其他钱包/节点连接；listen=0 时仅出站连接）
+# listen=1
+# port=28332
+
+# P2P 节点列表（bitcoin 风格 addnode，可重复）：本地/远程全节点地址均可，
+# 钱包按顺序尝试 HTTP RPC，失败自动降级为 WebSocket P2P。
+# 未配置 addnode 时默认连 node 键指定的节点（默认 http://127.0.0.1:28332）
+# addnode=http://127.0.0.1:28332
+# node=http://127.0.0.1:28332
+
+# --- 游戏网关（游戏页 → ws://127.0.0.1:gameport → 本钱包/节点；未配置 gameport 则不启动）---
+# 监听端口（仅本机 127.0.0.1；请避免与 rpcport/port 冲突；Windows 首次监听可能触发防火墙授权）
+# gameport=7878
+# 允许连接的游戏页面 Origin 白名单（可重复；游戏部署在公网域名时填 https://<游戏域名>，
+# 本地开发填 http://localhost:8080；留空 = 拒绝所有游戏连接；* = 放行全部，仅建议本地调试）
+# gameorigins=http://localhost:8080
+# gameorigins=https://game.example.com
+# 配对令牌（可选）：游戏页 hello 需携带相同 token 才能完成握手（与 Origin 白名单互为纵深；
+# 注意 token 随游戏页面分发、对访问者可见，它只是第二道门槛，真正的防线是 Origin 白名单 + 本机监听）
+# gamepairtoken=my-game-token
+# 单次上传自动签名小费金额/上限（EDX，默认 0.001）
+# gamefee=0.001
+# 每日游戏小费累计上限（EDX，默认 0.5）：防本地端口被攻破时小额盗刷，超限当日拒绝上传
+# gamefeeperday=0.5
+# 游戏小费收款地址（必填才能上传）：每笔上传自动签的小费交易发往该地址（等价旧后端 GAME_REWARD_ADDRESS）
+# gamefeeaddress=EDX...
+# 上榜最低分数（默认 0）
+# gameminscore=0
+# 结算周期奖励档位（可重复，EDX；默认空 = 不设奖励）
+# gamerewards=10
+# gamerewards=5
+# gamerewards=1
+# 每日结算小时（UTC，默认 8，即每日 08:00 UTC 结算前五奖励）
+# gamesettlehourutc=8
+# 上传数据体积上限（字节，默认 65536）
+# gamemaxsize=65536
+# 上传频率上限（次/分钟，默认 60）
+# gamemaxfreq=60
+
+# 数据目录（钱包文件 wallet.vault、通讯密钥 comm.key、本地游戏账本 game.db 等）；默认当前目录 ./EDX_DATA
+# datadir=/path/to/data
+
+# 钱包密码（可选）：daemon 无界面启动与脚本化一次性命令可由此注入；
+# 交互模式下会隐藏输入；金额操作（send）与显示助记词需验证密码；游戏上传需密码解锁
+# EDX_WALLET_PASSWORD=your-secret

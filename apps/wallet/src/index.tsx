@@ -21,6 +21,8 @@ import {
 } from "./keys/vaultLegacy";
 import { WalletCore } from "./core/walletCore";
 import { initGlobalData } from "./core/globalData";
+import { loadOrCreateCommKey, type CommKey } from "./keys/commKey";
+import { GameGate } from "./game/gameGate";
 import { CommandRegistry } from "./commands/registry";
 import { builtinCommands } from "./commands/commands";
 import { App } from "./tui/App";
@@ -77,21 +79,34 @@ function parseInitArgs(args: string[]): { restore?: string; restoreRequested: bo
 }
 
 function serviceSummary(config: WalletConfig): string {
-  return t("log.serviceSummary", {
-    rpc: config.rpcport !== undefined ? String(config.rpcport) : t("log.notConfigured"),
-    p2p: config.port !== undefined ? String(config.port) : t("log.notConfigured"),
-  });
+  const game = config.gamePort !== undefined ? String(config.gamePort) : t("log.notConfigured");
+  return (
+    t("log.serviceSummary", {
+      rpc: config.rpcport !== undefined ? String(config.rpcport) : t("log.notConfigured"),
+      p2p: config.port !== undefined ? String(config.port) : t("log.notConfigured"),
+    }) + " | " + t("log.gameSummary", { game })
+  );
 }
 
 function joinNodes(nodes: string[]): string {
   return nodes.join(currentLocale() === "zh" ? "、" : ", ");
 }
 
-function buildServices(config: WalletConfig, key: WalletKey, log: Logger) {
+function buildServices(config: WalletConfig, key: WalletKey, log: Logger, password?: string) {
+  let commKey: CommKey | undefined;
+  try {
+    commKey = loadOrCreateCommKey(config.datadir, { onWarn: (m) => log.warn(m), password });
+  } catch (e) {
+    log.warn(`Communication key load failed: ${(e as Error).message}; game saves will not be encrypted`);
+  }
   const core = new WalletCore(config, key, log);
   const registry = new CommandRegistry();
   registry.registerAll(builtinCommands());
-  return { core, registry };
+  const game =
+    config.gamePort !== undefined && config.gamePort > 0
+      ? new GameGate({ config, core, commKey, password, log })
+      : null;
+  return { core, registry, game };
 }
 
 function runOnboarding(config: WalletConfig, log: Logger): Promise<{ key: WalletKey; created: boolean }> {
@@ -136,6 +151,7 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
   if (tui && process.stdout.isTTY) await warnAndPromptTuiEnv(log);
 
   let key: WalletKey;
+  let password: string | undefined;
   let created = false;
   if (!hasWalletFile(config.datadir)) {
     if (!tui || !process.stdout.isTTY) {
@@ -146,19 +162,23 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
     key = result.key;
     created = result.created;
   } else {
-    key = (await loadExistingWallet(config, log)).key;
+    const loaded = await loadExistingWallet(config, log);
+    key = loaded.key;
+    password = loaded.password;
   }
 
   const message = created ? t("log.walletCreated", { address: key.address }) : t("log.walletLoaded", { address: key.address });
   if (created) log.warn(message);
   else log.info(message);
 
-  const { core, registry } = buildServices(config, key, log);
+  const { core, registry, game } = buildServices(config, key, log, password);
   const rpc = startWalletRpc(config, core, log);
   try {
     await core.start();
+    game?.start();
   } catch (error) {
     rpc?.stop();
+    game?.stop();
     console.error(`Startup failed: ${(error as Error).message}`);
     process.exit(1);
   }
@@ -168,6 +188,7 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
     if (exiting) return;
     exiting = true;
     rpc?.stop();
+    game?.stop();
     void core.stop().finally(() => process.exit(0));
   };
   core.bus.on("shutdown", exit);
@@ -240,7 +261,7 @@ async function runOneShot(command: string, args: string[], paths: CliPaths): Pro
     process.exit(1);
   }
   const loaded = await loadExistingWallet(config, log);
-  const { core, registry } = buildServices(config, loaded.key, log);
+  const { core, registry } = buildServices(config, loaded.key, log, loaded.password);
   await core.start().catch(() => undefined);
   try {
     const output = await registry.execute(`${command} ${args.join(" ")}`, {

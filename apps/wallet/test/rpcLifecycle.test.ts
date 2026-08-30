@@ -14,6 +14,16 @@ function createConfig(overrides: Partial<WalletConfig> = {}): WalletConfig {
     rpcport: 0,
     listen: false,
     addnodes: [],
+    gameOrigins: [],
+    gamePairToken: "",
+    gameFee: "0.001",
+    gameFeePerDay: "0.5",
+    gameFeeAddress: "",
+    gameMinScore: 0,
+    gameRewards: [],
+    gameSettleHourUtc: 8,
+    gameMaxSize: 65536,
+    gameMaxFreq: 60,
     ...overrides,
   };
 }
