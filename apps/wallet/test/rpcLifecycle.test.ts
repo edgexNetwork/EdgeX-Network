@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { startWalletRpc } from "../src/rpc/lifecycle";
 import { Logger } from "../src/utils/log";
+import { DEFAULT_MAX_SEGMENT_BYTES } from "../src/config/config";
 import type { WalletConfig } from "../src/config/config";
 import type { WalletCore } from "../src/core/walletCore";
 
@@ -24,6 +25,7 @@ function createConfig(overrides: Partial<WalletConfig> = {}): WalletConfig {
     gameSettleHourUtc: 8,
     gameMaxSize: 65536,
     gameMaxFreq: 60,
+    maxSegmentBytes: DEFAULT_MAX_SEGMENT_BYTES,
     ...overrides,
   };
 }

@@ -17,6 +17,8 @@ export const MNEMONIC_FILE_NAME = "wallet.mnemonic";
 export const VAULT_FILE_NAME = "wallet.vault";
 
 export const CHAIN_DB_FILE_NAME = "chain.db";
+/** Default threshold (bytes) for segmenting the local chain database: when the active database grows past this size it is sealed into read-only compressed segments. */
+export const DEFAULT_MAX_SEGMENT_BYTES = 500 * 1024 * 1024;
 
 export interface WalletConfig {
   datadir: string;
@@ -33,28 +35,30 @@ export interface WalletConfig {
   addnodes: string[];
   nodeUrl?: string;
 
-  /** 本地游戏网关端口（dexcoin.conf gameport）；未配置则不启动游戏网关 */
+  /** Local game gateway port (dexcoin.conf gameport); the gateway is not started when unset */
   gamePort?: number;
-  /** 允许连接的游戏页面 Origin 列表（dexcoin.conf gameorigins，可重复；空 = 拒绝全部游戏连接） */
+  /** Allowed game page Origins (dexcoin.conf gameorigins, repeatable; empty = reject all game connections) */
   gameOrigins: string[];
-  /** 游戏配对令牌（dexcoin.conf gamepairtoken，可选）：与 Origin 白名单互为纵深，游戏页 hello 需携带 */
+  /** Game pairing token (dexcoin.conf gamepairtoken, optional): defense in depth alongside the Origin whitelist; the game page hello must include it */
   gamePairToken: string;
-  /** 单次游戏上传自动签名小费上限（EDX，gamefee，默认 0.001）：同时也是默认小费金额 */
+  /** Per-upload auto-signed tip cap (EDX, gamefee, default 0.001); also the default tip amount */
   gameFee: string;
-  /** 每日游戏小费累计上限（EDX，gamefeeperday，默认 0.5；超限拒绝上传，防本地端口被攻破盗刷） */
+  /** Daily cumulative game tip cap (EDX, gamefeeperday, default 0.5; uploads over the cap are rejected to prevent drain if the local port is compromised) */
   gameFeePerDay: string;
-  /** 游戏小费收款地址（gamefeeaddress）：每笔上传自动签名的小费交易发往该地址；未配置时上传被拒 */
+  /** Game tip recipient address (gamefeeaddress): each upload's auto-signed tip transaction is sent here; uploads are rejected when unset */
   gameFeeAddress: string;
-  /** 上榜最低分数（gameminscore，默认 0） */
+  /** Minimum score to qualify for the leaderboard (gameminscore, default 0) */
   gameMinScore: number;
-  /** 结算周期奖励档位（gamerewards，可重复，EDX；默认空 = 不设奖励） */
+  /** Settlement cycle reward tiers (gamerewards, repeatable, EDX; empty by default = no rewards) */
   gameRewards: string[];
-  /** 每日结算小时（UTC，gamesettlehourutc，默认 8，即每日 08:00 UTC） */
+  /** Daily settlement hour (UTC, gamesettlehourutc, default 8, i.e. 08:00 UTC) */
   gameSettleHourUtc: number;
-  /** 上传数据体积上限（字节，gamemaxsize，默认 65536） */
+  /** Upload data size cap (bytes, gamemaxsize, default 65536) */
   gameMaxSize: number;
-  /** 上传频率上限（次/分钟，gamemaxfreq，默认 60） */
+  /** Upload rate cap (per minute, gamemaxfreq, default 60) */
   gameMaxFreq: number;
+  /** Local chain database segmentation threshold (bytes, maxsegmentbytes); the active database is sealed once exceeded */
+  maxSegmentBytes: number;
 }
 
 export function defaultDatadir(): string {
@@ -106,7 +110,7 @@ const datadir = cliPaths.datadir ?? confGet(raw, "datadir") ?? baseDatadir;
   const rpcport = confGetIntOpt(raw, "rpcport");
   const port = confGetIntOpt(raw, "port");
 
-  // 游戏网关端口（gameport）：与 rpcport 同语义（可选正整数），但先剥离外层引号
+  // Game gateway port (gameport): same semantics as rpcport (optional positive integer), but strip outer quotes first
   const gamePort = (() => {
     const rawValue = confGet(raw, "gameport");
     if (rawValue === undefined) return undefined;
@@ -146,11 +150,12 @@ const datadir = cliPaths.datadir ?? confGet(raw, "datadir") ?? baseDatadir;
     gameSettleHourUtc: Math.min(23, Math.max(0, confGetInt(raw, "gamesettlehourutc", 8))),
     gameMaxSize: Math.max(0, confGetInt(raw, "gamemaxsize", 65536)),
     gameMaxFreq: Math.max(0, confGetInt(raw, "gamemaxfreq", 60)),
+    maxSegmentBytes: Math.max(confGetInt(raw, "maxsegmentbytes", DEFAULT_MAX_SEGMENT_BYTES), 16 * 1024 * 1024),
   };
   return { config, warnings };
 }
 
-/** 剥离配置值外层成对引号（bitcoin.conf 风格：可选加引号，解析时去除）。 */
+/** Strip paired outer quotes from a config value (bitcoin.conf style: quotes are optional and removed when parsing). */
 function unquote(value: string): string {
   const v = value.trim();
   if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {

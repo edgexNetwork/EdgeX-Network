@@ -7,8 +7,9 @@ import type { Logger } from "../utils/log";
 import { GameStore } from "./gameStore";
 
 /**
- * 游戏配置镜像（旧中心化版由后端 /api/game/info 下发；去中心化版从 dexcoin.conf 本地解析，
- * 字段对齐旧 DTO，游戏页无需感知差异）。cycleStart/cycleEnd/nextSettle 按 gamesettlehourutc 推算。
+ * Game config mirror (the old centralized build served it via the backend /api/game/info; the
+ * decentralized build parses it locally from dexcoin.conf and keeps the old DTO field layout so the
+ * game page cannot tell the difference). cycleStart/cycleEnd/nextSettle are derived from gamesettlehourutc.
  */
 export interface GameInfo {
   fee: string;
@@ -23,21 +24,21 @@ export interface GameInfo {
   maxFreq: number;
 }
 
-/** 单连接每分钟消息数上限（防本地端口被连发刷爆）。 */
+/** Max messages per connection per minute (protects the local port from message floods). */
 const MAX_MSG_PER_MINUTE = 180;
-/** 排行榜返回条数上限。 */
+/** Leaderboard result row cap. */
 const LEADERBOARD_LIMIT = 50;
 
 export interface GameGateOptions {
   config: WalletConfig;
   core: WalletCore;
   commKey?: CommKey;
-  /** 钱包密码（TUI 解锁后内存持有 / daemon 的 EDX_WALLET_PASSWORD）；缺失时上传被拒，仅只读查询可用。 */
+  /** Wallet password (held in memory after TUI unlock / daemon's EDX_WALLET_PASSWORD); uploads are rejected when missing, read-only queries still work. */
   password?: string;
   log: Logger;
 }
 
-/** WS 连接附加数据：握手时记录的 Origin + hello 配对结果。 */
+/** WS connection metadata: Origin recorded at handshake + hello pairing result. */
 interface SocketData {
   origin: string;
   authed: boolean;
@@ -52,7 +53,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** 按每日结算小时（UTC）推算当前结算周期窗口。 */
+/** Derives the current settlement cycle window from the daily settlement hour (UTC). */
 function settleCycle(
   settleHourUtc: number,
   nowMs: number,
@@ -86,22 +87,22 @@ function buildGameInfo(config: WalletConfig): GameInfo {
 }
 
 /**
- * 本地游戏网关：游戏页面（公网域名）→ ws://127.0.0.1:gameport → 本钱包。
- * - 仅监听 127.0.0.1；握手校验 Origin ∈ dexcoin.conf 的 gameorigins 白名单（`*` = 放行全部，仅建议本地调试）；
- * - hello 校验配对令牌（gamepairtoken，可选）并把令牌记为本会话授权；未 hello 的连接不能做任何操作；
- * - upload 由钱包自动签一笔小费交易（金额 = gamefee，受 gamefee / gamefeeperday 上限钳制）并直接广播上链，
- *   数据记录落在钱包本地账本（game.db），uploadId 幂等、重试不重复扣费；
- * - 存档读取（save:get）用钱包 comm 私钥解密，明文仅在 localhost 内回传游戏页；
- * - 钱包锁定（auth:change=false）时断开全部连接，游戏无法继续。
+ * Local game gateway: game page (public domain) → ws://127.0.0.1:gameport → this wallet.
+ * - Listens on 127.0.0.1 only; the handshake validates Origin against the gameorigins whitelist in dexcoin.conf (`*` allows all, recommended for local debugging only);
+ * - hello validates the pairing token (gamepairtoken, optional) and records it as session authorization; connections that never hello cannot do anything;
+ * - upload has the wallet auto-sign a tip transaction (amount = gamefee, clamped by the gamefee / gamefeeperday caps) and broadcasts it on-chain directly;
+ *   the record lands in the wallet's local ledger (game.db), uploadId is idempotent and retries never double-charge;
+ * - save reads (save:get) are decrypted with the wallet comm private key; plaintext only ever goes back to the game page over localhost;
+ * - when the wallet is locked (auth:change=false) all connections are dropped and the game cannot continue.
  */
 export class GameGate {
   private server: ReturnType<typeof Bun.serve<SocketData>> | null = null;
   private sockets = new Set<ServerWebSocket<SocketData>>();
   private readonly store: GameStore;
-  /** 今日已扣小费累计（sat，内存计数，重启归零）。 */
+  /** Cumulative tips charged today (sat, in-memory counter, resets on restart). */
   private dailyFeeSat = 0n;
   private dailyKey = "";
-  /** 会话锁定标记：auth:change(false) 置位并断开全部连接；密码校验成功（auth:change(true)）复位。 */
+  /** Session lock flag: set by auth:change(false) which also drops all connections; cleared by a successful password check (auth:change(true)). */
   private locked = false;
   private readonly unsub: () => void;
 
@@ -129,7 +130,7 @@ export class GameGate {
       fetch: (req, server) => {
         const origin = req.headers.get("origin") ?? "";
         if (!this.originAllowed(origin)) return new Response("forbidden", { status: 403 });
-        // 握手成功后连接由 Bun 接管（官方示例约定此处返回 undefined）
+        // After a successful handshake Bun takes over the connection (official example convention: return undefined here)
         if (server.upgrade(req, { data: { origin, authed: false, hits: [] } })) return undefined;
         return new Response("bad request", { status: 400 });
       },
@@ -196,7 +197,7 @@ export class GameGate {
     }
     const type = typeof msg.type === "string" ? msg.type : "";
     const seq = typeof msg.seq === "number" ? msg.seq : undefined;
-    // 除 hello 外一律要求已完成配对授权
+    // Everything but hello requires completed pairing authorization
     if (type !== "hello" && !ws.data.authed) {
       reply(ws, { type: "error", seq, ok: false, error: "not authorized: send hello with the pairing token first" });
       ws.close(4003, "not authorized");
@@ -283,7 +284,7 @@ export class GameGate {
     }
     const gameId = typeof msg.gameId === "string" ? msg.gameId : "";
     const uploadId = typeof msg.uploadId === "string" ? msg.uploadId : "";
-    // 幂等：本地已存在同 (gameId, uploadId)，直接回执不重复广播/扣费（重试不消耗每日额度）
+    // Idempotent: same (gameId, uploadId) already stored locally → ack without re-broadcasting/charging (retries don't consume the daily cap)
     const existing = this.store.findByUploadId(gameId, uploadId);
     if (existing) {
       reply(ws, { type: "upload", seq, ok: true, duplicate: true, txid: existing.txid });
@@ -315,7 +316,7 @@ export class GameGate {
       });
       return;
     }
-    // 自动签名小费交易（金额 = gamefee）并直接广播上链，txid 作为本次上传的链上锚点
+    // Auto-sign a tip transaction (amount = gamefee) and broadcast it on-chain; txid is the on-chain anchor for this upload
     let txid: string;
     try {
       const feeTx = await core.buildGameFeeTx([{ address: info.feeAddress, amount: info.fee }], this.opts.password);
@@ -341,7 +342,7 @@ export class GameGate {
     reply(ws, { type: "upload", seq, ok: true, duplicate: false, txid });
   }
 
-  /** 存档载荷落库：有 commKey 时加密为 ECIES 信封（game.db 不落明文）；无密钥时原样存储。 */
+  /** Stores the save payload: encrypted into an ECIES envelope when a commKey is present (game.db never holds plaintext); stored as-is without one. */
   private buildStoredPayload(msg: Record<string, unknown>): string | null {
     const raw = msg.payload;
     if (raw === undefined) return null;
@@ -363,7 +364,7 @@ export class GameGate {
     reply(ws, { type: "save:get", seq, ok: true, payload: this.decryptStoredPayload(record.payload) });
   }
 
-  /** 解密存档：失败（无密钥写入的明文存档）原样回传，明文仅经 ws:// localhost 流出。 */
+  /** Decrypts a save: on failure (plaintext save written with no key) returns it as-is; plaintext only ever leaves here over ws:// localhost. */
   private decryptStoredPayload(stored: string): unknown {
     try {
       return decryptJson(JSON.parse(stored) as never, this.opts.commKey!.privateKeyHex);
@@ -388,7 +389,7 @@ export class GameGate {
     });
   }
 
-  /** 游戏配置镜像：来自本地 dexcoin.conf（旧版请求后端 /api/game/info，去中心化版无后端）。 */
+  /** Game config mirror: from local dexcoin.conf (the old build requested the backend /api/game/info; the decentralized build has no backend). */
   private getInfo(): GameInfo {
     return buildGameInfo(this.opts.config);
   }

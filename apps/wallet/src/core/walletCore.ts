@@ -13,8 +13,9 @@ import type { Logger } from "../utils/log";
 import type { WalletConfig } from "../config/config";
 import type { WalletKey } from "../keys/walletKeyClean";
 import path from "node:path";
+import { existsSync, rmSync } from "node:fs";
 import { CHAIN_DB_FILE_NAME } from "../config/config";
-import { ChainDataError, ChainStore, deriveChainDbKey } from "./walletDatabase";
+import { ChainDataError, ChainStore, isLegacyEncryptedChainDb } from "./walletDatabase";
 import { normalizePayments, planSplitTransfer } from "./transactionPlanner";
 
 const POLL_INTERVAL_MS = 15_000;
@@ -52,11 +53,19 @@ export class WalletCore {
     private readonly log: Logger,
   ) {
     const baseUrl = config.nodeUrl ?? config.addnodes[0] ?? "http://127.0.0.1:28332";
-    this.database = new ChainStore(
-      path.join(config.datadir, CHAIN_DB_FILE_NAME),
-      deriveChainDbKey(key.privateKey),
-      key.address,
-    );
+    // Legacy whole-file encrypted chain database (EDXCHDB, v1/v2): migration cost grows
+    // linearly with database size, so it is deleted instead and fully re-synced on startup
+    // (chain data can be rebuilt from nodes)
+    const chainDbPath = path.join(config.datadir, CHAIN_DB_FILE_NAME);
+    if (isLegacyEncryptedChainDb(chainDbPath)) {
+      try {
+        rmSync(chainDbPath, { force: true });
+        this.log.info("Legacy encrypted chain database removed; full resync will rebuild it");
+      } catch (error) {
+        this.log.warn(`Legacy chain database removal failed: ${(error as Error).message}`);
+      }
+    }
+    this.database = new ChainStore(chainDbPath, key.address, config.maxSegmentBytes);
     this.conn = new ConnectionManager({
       nodeUrl: baseUrl,
       configuredNodes: config.addnodes,
@@ -97,7 +106,6 @@ export class WalletCore {
     if (this.timer) clearInterval(this.timer);
     this.conn.stop();
     try {
-      this.database.save();
       this.database.close();
     } catch (error) {
       this.log.warn(`Wallet database close failed: ${(error as Error).message}`);
@@ -273,10 +281,11 @@ export class WalletCore {
   }
 
   /**
-   * 构建并签名一笔游戏小费交易（自动签名免确认路径，供本地游戏网关使用）：
-   * 与 send() 同一套选币/签名机制（FIFO 选输入 + 按体积计费 + 找零），但只返回已签名交易，
-   * 直接广播上链、无交互确认——安全边界靠游戏网关钳制单笔上限（gamefee）与每日累计上限（gamefeeperday）。
-   * 密码校验：显式 password（TUI 解锁后内存持有 / daemon 的 EDX_WALLET_PASSWORD），缺失时抛错。
+   * Builds and signs a game tip transaction (auto-sign, no-confirmation path for the local game gateway):
+   * uses the same coin selection/signing mechanism as send() (FIFO input selection + size-based fee + change),
+   * but only returns the signed transaction and never asks for interactive confirmation — the security
+   * boundary relies on the game gateway clamping the per-tx cap (gamefee) and the daily cap (gamefeeperday).
+   * Password: explicit password (held in memory after TUI unlock / daemon's EDX_WALLET_PASSWORD); throws when missing.
    */
   async buildGameFeeTx(payments: PaymentInput[], password?: string): Promise<SignedTransaction> {
     if (!this.chain.isSynced()) {
@@ -302,7 +311,7 @@ export class WalletCore {
       .request<{ items: UtxoDTO[] }>("GET", `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`)
       .then((result) => result.items)).filter((utxo) => utxo.spendable);
 
-    // 小费金额极小，单笔转账即可覆盖（planSplitTransfer 保证 payments 非空时至少一个 chunk）
+    // The tip amount is tiny, so a single transfer covers it (planSplitTransfer guarantees at least one chunk when payments is non-empty)
     const chunk = planSplitTransfer(utxos, normalizedPayments, fee.fee)[0]!;
     const outputs = chunk.outputs.map((output) => ({
       address: output.address,
@@ -374,11 +383,10 @@ export class WalletCore {
   }
 
   async resync(): Promise<void> {
-    this.log.info("Rebuilding encrypted wallet chain database");
+    this.log.info("Rebuilding local wallet chain database");
     this.database.rebuild();
     this.chain.setSync({ localHeight: 0, syncStatus: "syncing", syncError: null, lastBlockTime: null });
     await this.refreshChain();
-    this.database.save();
   }
 
   private async synchronizeLocalDatabase(networkHeight: number, expectedGenesisHash: string): Promise<void> {
@@ -401,7 +409,6 @@ export class WalletCore {
           throw new ChainDataError("local wallet database genesis does not match the selected node");
         }
         this.database.appendBlocks(page as Parameters<ChainStore["appendBlocks"]>[0]);
-        this.database.save();
         localHeight = this.database.localHeight();
         this.chain.setSync({
           localHeight: Math.max(0, localHeight),

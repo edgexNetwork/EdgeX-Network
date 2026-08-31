@@ -28,7 +28,7 @@ describe("game store", () => {
   test("inserts idempotently and finds by (gameId, uploadId)", () => {
     const s = store();
     s.insert(record());
-    s.insert(record({ name: "mallory" })); // 同 uploadId 忽略，保留首条
+    s.insert(record({ name: "mallory" })); // same uploadId ignored, first row kept
     const found = s.findByUploadId("snake", "u1");
     expect(found).not.toBeNull();
     expect(found!.name).toBe("alice");
@@ -59,7 +59,7 @@ describe("game store", () => {
     const rows = s.leaderboard("snake", 10);
     expect(rows.map((row) => row.score)).toEqual([300, 40, 10]);
     expect(rows.map((row) => row.name)).toEqual(["high", "mid", "low"]);
-    // 排行榜不泄漏存档载荷
+    // Leaderboard must not leak save payloads
     expect((rows[0] as { payload?: unknown }).payload).toBeUndefined();
     s.close();
   });
@@ -72,7 +72,7 @@ describe("game store", () => {
     expect(save).not.toBeNull();
     expect(save!.uploadId).toBe("new");
     expect(save!.payload).toBe("new-envelope");
-    // 存档记录不影响排行榜
+    // Save records do not affect the leaderboard
     expect(s.leaderboard("snake", 10)).toEqual([]);
     expect(s.findSave("other-game")).toBeNull();
     s.close();

@@ -3,21 +3,21 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { decryptJson, encryptJson, generateKeyPair, type KeyPair } from "@edgex/shared";
 
-/** ECIES 通讯密钥文件名（datadir/comm.key，JSON，0600）。 */
+/** ECIES communication key file name (datadir/comm.key, JSON, 0600). */
 export const COMM_KEY_FILE_NAME = "comm.key";
 const PRIVATE_KEY_PATTERN = /^[0-9a-fA-F]{64}$/;
 const PUBLIC_KEY_PATTERN = /^(02|03)[0-9a-fA-F]{64}$/;
 
-/** 钱包 ECIES 通讯密钥对：独立于 HD 地址密钥，专门用于通讯加解密（游戏存档等）。 */
+/** Wallet ECIES communication key pair: independent of the HD address keys, used purely for communication encryption (game saves, etc.). */
 export type CommKey = KeyPair;
 
 export interface CommKeyOptions {
   onWarn?: (message: string) => void;
-  /** 钱包密码：提供时 comm.key 私钥以 scrypt + AES-256-GCM 加密落盘（v2），未提供保持明文 v1。 */
+  /** Wallet password: when provided, the comm.key private key is encrypted to disk with scrypt + AES-256-GCM (v2); otherwise it stays plaintext (v1). */
   password?: string;
 }
 
-/** v2 加密文件：私钥用密码派生密钥加密，公钥明文（公钥公开）。 */
+/** v2 encrypted file: the private key is encrypted with a password-derived key, the public key is plaintext (public). */
 interface EncryptedCommKeyFile {
   v: 2;
   publicKeyHex: string;
@@ -37,7 +37,7 @@ function deriveKey(password: string, salt: Uint8Array): Uint8Array {
   return scryptSync(password, salt, 32, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: 64 * 1024 * 1024 });
 }
 
-/** 加密私钥为 v2 文件内容（返回 JSON 对象）。 */
+/** Encrypts the private key into v2 file contents (returns a JSON object). */
 export function encryptCommKeyFile(pair: KeyPair, password: string): EncryptedCommKeyFile {
   if (password.length < 1) throw new Error("Password must not be empty");
   const salt = randomBytes(SALT_LEN);
@@ -55,7 +55,7 @@ export function encryptCommKeyFile(pair: KeyPair, password: string): EncryptedCo
   };
 }
 
-/** 解密 v2 文件；密码错误或文件损坏抛错。 */
+/** Decrypts a v2 file; throws on wrong password or corrupted file. */
 export function decryptCommKeyFile(data: EncryptedCommKeyFile, password: string): string {
   if (data.v !== COMM_KEY_VERSION) throw new Error(`Unsupported comm.key version: ${data.v}`);
   try {
@@ -83,7 +83,7 @@ export function commKeyFilePath(datadir: string): string {
   return path.join(datadir, COMM_KEY_FILE_NAME);
 }
 
-/** 校验密钥对：私钥/公钥格式 + 加密解密往返自检。 */
+/** Validates the key pair: private/public key format + encrypt/decrypt round-trip self-check. */
 export function isValidCommKey(pair: CommKey): boolean {
   if (!PRIVATE_KEY_PATTERN.test(pair.privateKeyHex)) return false;
   if (!PUBLIC_KEY_PATTERN.test(pair.publicKeyHex)) return false;
@@ -96,10 +96,10 @@ export function isValidCommKey(pair: CommKey): boolean {
 }
 
 /**
- * 加载或生成钱包通讯密钥（datadir/comm.key，0600）。
- * - v1 明文文件：配对校验通过直接复用；提供密码时自动迁移为 v2 加密（私钥不再明文落盘）；
- * - v2 加密文件：必须提供正确密码解锁；无密码抛错（调用方降级为不加密会话）；
- * - 文件缺失 → 生成并持久化（有密码写 v2，无密码写 v1）；损坏/不配对 → 重新生成并警告。
+ * Loads or generates the wallet communication key (datadir/comm.key, 0600).
+ * - v1 plaintext file: reused as-is once pairing checks pass; auto-migrated to v2 encryption when a password is provided (private key no longer stored in plaintext);
+ * - v2 encrypted file: the correct password is required to unlock; throws without a password (caller degrades to an unencrypted session);
+ * - missing file → generated and persisted (v2 with a password, v1 without); corrupted/unpaired → regenerated with a warning.
  */
 export function loadOrCreateCommKey(datadir: string, opts: CommKeyOptions = {}): CommKey {
   const file = commKeyFilePath(datadir);
@@ -113,7 +113,7 @@ export function loadOrCreateCommKey(datadir: string, opts: CommKeyOptions = {}):
     }
     if (raw !== null) {
       const obj = raw as Partial<KeyPair> & Partial<EncryptedCommKeyFile>;
-      // v2 加密文件：密码错误/损坏直接抛错（绝不静默重建，否则已注册公钥失效）
+      // v2 encrypted file: throw directly on wrong password/corruption (never silently rebuild, otherwise registered public keys become invalid)
       if (obj.v === COMM_KEY_VERSION) {
         if (opts.password === undefined) {
           throw new Error("comm.key is password-encrypted; unlock with the wallet password");
@@ -125,7 +125,7 @@ export function loadOrCreateCommKey(datadir: string, opts: CommKeyOptions = {}):
         if (!isValidCommKey(pair)) throw new Error("decrypted comm.key pair invalid");
         return pair;
       }
-      // v1 明文：校验配对；提供密码时迁移为 v2
+      // v1 plaintext: verify pairing; migrate to v2 when a password is provided
       const pair: CommKey = {
         privateKeyHex: String(obj.privateKeyHex ?? ""),
         publicKeyHex: String(obj.publicKeyHex ?? ""),

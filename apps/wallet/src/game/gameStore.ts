@@ -12,16 +12,17 @@ export interface GameUploadRecord {
   score: number | null;
   wave: number | null;
   lives: number | null;
-  /** 存档载荷：commKey 加密信封的 JSON 字符串；无密钥可用时原样（明文）存储 */
+  /** Save payload: JSON string of the commKey-encrypted envelope; stored as-is (plaintext) when no key is available */
   payload: string | null;
   txid: string;
   createdAt: number;
 }
 
 /**
- * 本地游戏账本（datadir/game.db，SQLite）：游戏上传的分数/存档记录。
- * 去中心化版没有中心化后端承载游戏数据，上传记录落在钱包本地；
- * 每笔上传同时广播一笔小费交易上链（txid 为链上锚点），(gameId, uploadId) 唯一键保证幂等重试不重复扣费。
+ * Local game ledger (datadir/game.db, SQLite): score/save records uploaded by games.
+ * The decentralized build has no central backend to host game data, so upload records live in the wallet;
+ * every upload also broadcasts a tip transaction on-chain (txid is the on-chain anchor), and the
+ * (gameId, uploadId) unique key makes retries idempotent so they never double-charge.
  */
 export class GameStore {
   private db: Database;
@@ -46,7 +47,7 @@ export class GameStore {
     `);
   }
 
-  /** 按 (gameId, uploadId) 幂等查找：命中即视为重复上传，重试不重复扣费。 */
+  /** Idempotent lookup by (gameId, uploadId): a hit counts as a duplicate upload, so retries never double-charge. */
   findByUploadId(gameId: string, uploadId: string): GameUploadRecord | null {
     if (uploadId === "") return null;
     const row = this.db
@@ -58,7 +59,7 @@ export class GameStore {
     return row ?? null;
   }
 
-  /** 写入一条上传记录（INSERT OR IGNORE：重复 uploadId 静默保留首条）。 */
+  /** Inserts one upload record (INSERT OR IGNORE: duplicate uploadId silently keeps the first row). */
   insert(record: GameUploadRecord): void {
     this.db
       .query(
@@ -79,7 +80,7 @@ export class GameStore {
       );
   }
 
-  /** 排行榜：按分数降序（不含存档类记录），返回记录不含 payload 字段（隐私，仅 localhost 解密回传）。 */
+  /** Leaderboard: score descending (save-kind records excluded); returned rows omit the payload field (privacy — decrypted only locally over localhost). */
   leaderboard(gameId: string, limit: number): GameUploadRecord[] {
     const rows = this.db
       .query(
@@ -93,7 +94,7 @@ export class GameStore {
     return rows;
   }
 
-  /** 最新存档（kind='save'）：供 save:get 取回后解密回传。 */
+  /** Latest save (kind='save'): fetched by save:get, decrypted and returned. */
   findSave(gameId: string): GameUploadRecord | null {
     const row = this.db
       .query(

@@ -10,6 +10,7 @@ import { GameGate } from "../src/game/gameGate";
 import { GameStore } from "../src/game/gameStore";
 import { encryptCommKeyFile, decryptCommKeyFile, loadOrCreateCommKey, type CommKey } from "../src/keys/commKey";
 import { Logger } from "../src/utils/log";
+import { DEFAULT_MAX_SEGMENT_BYTES } from "../src/config/config";
 import type { WalletConfig } from "../src/config/config";
 import type { WalletCore } from "../src/core/walletCore";
 
@@ -38,11 +39,12 @@ function testConfig(datadir: string, overrides: Partial<WalletConfig> = {}): Wal
     gameSettleHourUtc: 8,
     gameMaxSize: 65536,
     gameMaxFreq: 60,
+    maxSegmentBytes: DEFAULT_MAX_SEGMENT_BYTES,
     ...overrides,
   };
 }
 
-/** 找一个空闲端口（游戏网关只监听 127.0.0.1）。 */
+/** Finds a free port (the game gateway only listens on 127.0.0.1). */
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = createServer();
@@ -84,7 +86,7 @@ function stubCore(calls: StubCoreCalls = { builds: 0, broadcasts: 0, txidIndex: 
   } as unknown as WalletCore;
 }
 
-/** 简化 WS 客户端：排队收消息 + 超时保护。 */
+/** Simplified WS client: queues incoming messages + timeout protection. */
 interface TestSocket {
   socket: WebSocket;
   send: (payload: unknown) => void;
@@ -158,10 +160,10 @@ describe("game gateway", () => {
 
   test("rejects connections from origins outside the whitelist", async () => {
     const { port } = await startGate({ gameOrigins: ["http://localhost:8080"] }, freshCalls());
-    // 白名单外 Origin：HTTP 层直接 403
+    // Origin outside the whitelist: rejected directly at the HTTP layer with 403
     const forbidden = await fetch(`http://127.0.0.1:${port}/`, { headers: { origin: "https://evil.example" } });
     expect(forbidden.status).toBe(403);
-    // 白名单内 Origin：通过 Origin 检查（无 upgrade 头因此 400，而不是 403）
+    // Origin inside the whitelist: passes the Origin check (no upgrade header, so 400 rather than 403)
     const allowed = await fetch(`http://127.0.0.1:${port}/`, { headers: { origin: "http://localhost:8080" } });
     expect(allowed.status).toBe(400);
   });
@@ -169,14 +171,14 @@ describe("game gateway", () => {
   test("hello validates the pairing token and reports wallet state", async () => {
     const { port } = await startGate({ gamePairToken: "pair-token" }, freshCalls());
     const client = await testSocket(port);
-    // 令牌错误：拒绝并断开
+    // Wrong token: rejected and disconnected
     client.send({ type: "hello", token: "wrong" });
     const rejected = (await client.next()) as { type: string; ok: boolean };
     expect(rejected.type).toBe("hello");
     expect(rejected.ok).toBe(false);
     expect((await client.closed).code).toBe(4003);
 
-    // 令牌正确：返回地址/通讯公钥/解锁状态/游戏配置
+    // Correct token: returns address/comm public key/unlock status/game config
     const client2 = await testSocket(port);
     client2.send({ type: "hello", token: "pair-token" });
     const hello = (await client2.next()) as {
@@ -222,7 +224,7 @@ describe("game gateway", () => {
     expect(calls.builds).toBe(1);
     expect(calls.broadcasts).toBe(1);
 
-    // 重试同 uploadId：直接回 duplicate，不重复签名/广播
+    // Retrying the same uploadId: replies duplicate directly, no re-signing or re-broadcasting
     client.send({ type: "upload", gameId: "snake", kind: "score", uploadId: "u1", name: "alice", score: 120 });
     const retry = (await client.next()) as { type: string; ok: boolean; duplicate: boolean; txid: string };
     expect(retry.ok).toBe(true);
@@ -231,7 +233,7 @@ describe("game gateway", () => {
     expect(calls.builds).toBe(1);
     expect(calls.broadcasts).toBe(1);
 
-    // 本地账本落库
+    // Record persisted in the local ledger
     const store = new GameStore(config.datadir);
     const record = store.findByUploadId("snake", "u1");
     expect(record).not.toBeNull();
@@ -239,7 +241,7 @@ describe("game gateway", () => {
     expect(record!.txid).toBe("tx-1");
     store.close();
 
-    // 排行榜
+    // Leaderboard
     client.send({ type: "leaderboard", gameId: "snake" });
     const board = (await client.next()) as { data: { items: Array<{ score: number }> } };
     expect(board.data.items.length).toBe(1);
@@ -254,19 +256,19 @@ describe("game gateway", () => {
     client.send({ type: "hello" });
     await client.next();
 
-    // 第一笔消耗完整日额度
+    // The first upload consumes the whole daily cap
     client.send({ type: "upload", gameId: "snake", kind: "score", uploadId: "u1", score: 1 });
     const first = (await client.next()) as { ok: boolean; duplicate: boolean };
     expect(first.ok).toBe(true);
     expect(first.duplicate).toBe(false);
 
-    // 新上传被日额度拒绝
+    // A new upload is rejected by the daily cap
     client.send({ type: "upload", gameId: "snake", kind: "score", uploadId: "u2", score: 2 });
     const blocked = (await client.next()) as { ok: boolean; error: string };
     expect(blocked.ok).toBe(false);
     expect(blocked.error).toMatch(/daily game fee cap/);
 
-    // 重复上传不受日额度影响（重试不重复扣费）
+    // Duplicate uploads are unaffected by the daily cap (retries never double-charge)
     client.send({ type: "upload", gameId: "snake", kind: "score", uploadId: "u1", score: 1 });
     const retry = (await client.next()) as { ok: boolean; duplicate: boolean };
     expect(retry.ok).toBe(true);
@@ -301,11 +303,11 @@ describe("game gateway", () => {
     client.send({ type: "hello" });
     await client.next();
 
-    // 钱包锁定：断开全部游戏连接
+    // Wallet lock: drop all game connections
     core.bus.emit("auth:change", false);
     expect((await client.closed).code).toBe(4001);
 
-    // 锁定期 hello 仍可读（unlocked=false），upload 被拒
+    // While locked, hello is still readable (unlocked=false), but upload is rejected
     const client2 = await testSocket(port);
     client2.send({ type: "hello" });
     const hello = (await client2.next()) as { unlocked: boolean };

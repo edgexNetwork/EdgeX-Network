@@ -60,8 +60,8 @@ export function splitWords(input: string): string[] {
 }
 
 /**
- * 命令注册表：TUI 底部命令行与一次性 CLI 共用。
- * RPC 方法直接调用 WalletCore（与命令语义一致）。
+ * Command registry shared by the TUI bottom command line and one-shot CLI.
+ * RPC methods call WalletCore directly (consistent with command semantics).
  */
 export class CommandRegistry {
   private map = new Map<string, Command>();
