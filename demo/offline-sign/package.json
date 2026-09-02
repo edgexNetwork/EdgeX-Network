@@ -1,0 +1,11 @@
+{
+  "name": "@edgex/offline-sign-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@edgex/shared": "workspace:*",
+    "@scure/bip32": "^1.6.0",
+    "@scure/bip39": "^1.5.0"
+  }
+}

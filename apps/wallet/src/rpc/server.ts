@@ -3,12 +3,14 @@ import type { WalletCore } from "../core/walletCore";
 import type { TxView } from "../api/types";
 import type { Logger } from "../utils/log";
 import type { WalletConfig } from "../config/config";
+import { decodeBlockHex, submitBlock } from "../core/rpcCore";
 
 const RPC_PARSE_ERROR = -32700;
 const RPC_INVALID_REQUEST = -32600;
 const RPC_METHOD_NOT_FOUND = -32601;
 const RPC_INVALID_PARAMS = -32602;
 const RPC_INTERNAL_ERROR = -32603;
+const RPC_GENERIC = -1;
 
 interface JsonRpcRequest {
   jsonrpc?: unknown;
@@ -39,7 +41,24 @@ function transactionDto(tx: TxView) {
   };
 }
 
-/** Local bitcoind-style JSON-RPC compatibility surface for the decentralized wallet core. */
+/** Estimated network difficulty derived from the live network power. */
+function miningDifficulty(networkPower: number): number {
+  return Math.max(1, Math.floor(networkPower * 15));
+}
+
+function sha256Hex(data: string): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+/**
+ * Local bitcoind-style JSON-RPC compatibility surface for the decentralized
+ * wallet core. Exposes the full method set the legacy wallet documented:
+ * wallet, raw transaction, mempool, block, mining and node control methods.
+ *
+ * `submitblock` is real: the hex payload is decoded into the consensus block
+ * shape and forwarded to the connected full node's `/blocks` endpoint, where
+ * the actual consensus pipeline validates and persists it.
+ */
 export class WalletRpcServer {
   private server?: ReturnType<typeof Bun.serve>;
   private miningRunning = false;
@@ -121,6 +140,7 @@ export class WalletRpcServer {
 
   private async dispatch(method: string, params: unknown[]): Promise<unknown> {
     switch (method) {
+      // ---- chain info ----
       case "getblockchaininfo": {
         const info = await this.core.getChainInfo();
         return {
@@ -138,17 +158,21 @@ export class WalletRpcServer {
         return this.core.getBlockCount();
       case "getbalance":
         return this.core.getBalance();
-      case "getnewaddress":
-        return this.core.getAddress();
+      case "getnewaddress": {
+        const label = typeof params[0] === "string" ? params[0] : undefined;
+        return this.core.getNewAddress(label);
+      }
       case "sendtoaddress": {
         this.requireParams(params, 2, 4);
         const [to, amount, fee, password] = params;
-        if (typeof to !== "string" || typeof amount !== "string") {
+        if (typeof to !== "string" || (typeof amount !== "string" && typeof amount !== "number")) {
           throw parameterError("sendtoaddress parameter error: <address> <amount> [fee] [password]");
         }
-        return this.core.send([{ address: to, amount }], {
-          explicitFee: typeof fee === "string" ? fee : null,
-        }, typeof password === "string" ? password : undefined);
+        if (password !== undefined && typeof password !== "string") {
+          throw parameterError("sendtoaddress password parameter must be a string");
+        }
+        const explicitFee = typeof fee === "string" ? fee : null;
+        return this.core.send([{ address: to, amount: String(amount) }], { explicitFee }, typeof password === "string" ? password : undefined);
       }
       case "gettransaction": {
         this.requireParams(params, 1, 1);
@@ -157,9 +181,11 @@ export class WalletRpcServer {
         return transaction ? transactionDto(transaction) : null;
       }
       case "listtransactions": {
-        this.requireParams(params, 0, 1);
+        this.requireParams(params, 0, 2);
         const count = typeof params[0] === "number" ? Math.floor(params[0]) : 20;
-        return (await this.core.listTransactions(count)).map(transactionDto);
+        const skip = typeof params[1] === "number" ? Math.floor(params[1]) : 0;
+        const all = await this.core.listTransactions(count + skip);
+        return all.slice(skip).map(transactionDto);
       }
       case "estimatesmartfee": {
         const fees = await this.core.getFees(true);
@@ -173,21 +199,376 @@ export class WalletRpcServer {
         }));
       case "getconnectioncount":
         return this.core.getConnectionCount();
-      case "getmininginfo": {
-        const info = await this.core.getChainInfo();
-        const mining = await this.core.getMiningInfo();
+
+      // ---- transfers ----
+      case "sendmany": {
+        this.requireParams(params, 2, 3);
+        const [dummy, amounts, password] = params;
+        if (typeof amounts !== "object" || amounts === null || Array.isArray(amounts)) {
+          throw parameterError("sendmany requires an amounts object {address: amount}");
+        }
+        const payments = Object.entries(amounts as Record<string, unknown>).map(([address, amount]) => ({
+          address,
+          amount: String(amount),
+        }));
+        return this.core.send(payments, {}, typeof password === "string" ? password : undefined);
+      }
+      case "send": {
+        this.requireParams(params, 1, 3);
+        const [outputs, , , password] = params;
+        if (!Array.isArray(outputs)) {
+          throw parameterError("send requires an outputs array [{address, amount}]");
+        }
+        const payments = (outputs as Array<{ address?: unknown; amount?: unknown }>).map((output) => ({
+          address: String(output.address ?? ""),
+          amount: String(output.amount ?? ""),
+        }));
+        return this.core.send(payments, {}, typeof password === "string" ? password : undefined);
+      }
+      case "sendall": {
+        this.requireParams(params, 1, 2);
+        const [addresses, password] = params;
+        if (!Array.isArray(addresses) || addresses.length === 0 || typeof addresses[0] !== "string") {
+          throw parameterError("sendall requires a target address array");
+        }
+        const utxos = await this.core.listUnspent(0, 9999999);
+        const total = utxos.reduce((sum, u) => sum + parseAmount(u.amount), 0n);
+        if (total <= 0n) throw codedError(RPC_GENERIC, "No spendable balance to send");
+        return this.core.send([{ address: addresses[0], amount: formatAmount(total) }], {}, typeof password === "string" ? password : undefined);
+      }
+
+      // ---- signing and message auth ----
+      case "signrawtransactionwithwallet": {
+        this.requireParams(params, 1, 1);
+        if (typeof params[0] !== "string") throw parameterError("signrawtransactionwithwallet requires hexstring");
+        return this.core.signRawTransaction(params[0]);
+      }
+      case "signmessage": {
+        this.requireParams(params, 2, 3);
+        const [address, message, password] = params;
+        if (typeof address !== "string" || typeof message !== "string") {
+          throw parameterError("signmessage requires <address> <message> [password]");
+        }
+        return this.core.signMessageForAddress(address, message, typeof password === "string" ? password : "");
+      }
+      case "verifymessage": {
+        this.requireParams(params, 3, 3);
+        const [address, signature, message] = params;
+        if (typeof address !== "string" || typeof signature !== "string" || typeof message !== "string") {
+          throw parameterError("verifymessage requires <address> <signature> <message>");
+        }
+        return this.core.verifyMessageForAddress(address, message, signature);
+      }
+      case "walletprocesspsbt":
+        throw codedError(RPC_METHOD_NOT_FOUND, "walletprocesspsbt is not supported: EDX has no PSBT (BIP174) transactions");
+
+      // ---- private keys and wallet export ----
+      case "dumpprivkey": {
+        this.requireParams(params, 1, 2);
+        const [address, password] = params;
+        if (typeof address !== "string") throw parameterError("dumpprivkey requires <address> [password]");
+        return this.core.dumpPrivKey(address, typeof password === "string" ? password : "");
+      }
+      case "dumpwallet": {
+        this.requireParams(params, 1, 2);
+        const [filename, password] = params;
+        if (typeof filename !== "string") throw parameterError("dumpwallet requires <filename> [password]");
+        const addresses = this.core.walletAddresses();
+        const lines = addresses.map((addr) => `${addr} ${this.core.dumpPrivKey(addr, typeof password === "string" ? password : "")}`);
+        return lines.join("\n");
+      }
+
+      // ---- password and encryption lifecycle ----
+      case "walletpassphrase": {
+        this.requireParams(params, 2, 2);
+        const [passphrase, timeout] = params;
+        if (typeof passphrase !== "string" || typeof timeout !== "number") {
+          throw parameterError("walletpassphrase requires <passphrase> <timeout>");
+        }
+        if (!this.core.unlock(passphrase)) {
+          throw codedError(RPC_GENERIC, "Wrong wallet passphrase");
+        }
+        return null;
+      }
+      case "walletlock":
+        this.core.lock();
+        return null;
+      case "walletpassphrasechange":
+        throw codedError(RPC_METHOD_NOT_FOUND, "walletpassphrasechange is not supported: EDX vault password change is done via CLI (init --force)");
+      case "encryptwallet":
+        throw codedError(RPC_METHOD_NOT_FOUND, "encryptwallet is not supported: EDX wallets are created with a password (vault)");
+
+      // ---- wallet read-only, balances and address management ----
+      case "getbalances":
+        return this.core.getBalances();
+      case "getwalletinfo":
+        return this.core.getWalletInfo();
+      case "getrawchangeaddress":
+        return this.core.getRawChangeAddress();
+      case "validateaddress": {
+        this.requireParams(params, 1, 1);
+        if (typeof params[0] !== "string") throw parameterError("validateaddress requires <address>");
+        return this.core.validateAddress(params[0]);
+      }
+      case "getaddressinfo": {
+        this.requireParams(params, 1, 1);
+        if (typeof params[0] !== "string") throw parameterError("getaddressinfo requires <address>");
+        return this.core.getAddressInfo(params[0]);
+      }
+      case "listunspent": {
+        this.requireParams(params, 0, 3);
+        const minconf = typeof params[0] === "number" ? Math.floor(params[0]) : 0;
+        const maxconf = typeof params[1] === "number" ? Math.floor(params[1]) : 9999999;
+        const addresses = Array.isArray(params[2]) ? (params[2] as unknown[]).filter((a): a is string => typeof a === "string") : undefined;
+        const utxos = await this.core.listUnspent(minconf, maxconf, addresses);
+        return utxos.map((u) => ({
+          txid: u.txid,
+          vout: u.index,
+          address: u.address,
+          amount: u.amount,
+          confirmations: u.confirmations,
+          spendable: true,
+          solvable: true,
+          safe: true,
+        }));
+      }
+      case "listsinceblock": {
+        const blockhash = typeof params[0] === "string" ? params[0] : undefined;
+        const result = await this.core.listSinceBlock(blockhash);
+        return { transactions: result.transactions.map(transactionDto), lastblock: result.lastblock };
+      }
+      case "importaddress": {
+        this.requireParams(params, 1, 2);
+        const [address, label] = params;
+        if (typeof address !== "string") throw parameterError("importaddress requires <address> [label]");
+        this.core.importAddress(address, typeof label === "string" ? label : undefined);
+        return null;
+      }
+      case "importdescriptors":
+        throw codedError(RPC_METHOD_NOT_FOUND, "importdescriptors is not supported: EDX has no output descriptors");
+      case "loadwallet":
+        throw codedError(RPC_METHOD_NOT_FOUND, "loadwallet is not supported: single-wallet per datadir");
+      case "unloadwallet":
+        throw codedError(RPC_METHOD_NOT_FOUND, "unloadwallet is not supported: single-wallet per datadir");
+      case "createwallet":
+        throw codedError(RPC_METHOD_NOT_FOUND, "createwallet is not supported: use CLI init to create a wallet");
+
+      // ---- raw transactions and PSBT ----
+      case "createrawtransaction": {
+        this.requireParams(params, 2, 2);
+        const [inputs, outputs] = params;
+        if (!Array.isArray(inputs) || typeof outputs !== "object" || outputs === null) {
+          throw parameterError("createrawtransaction requires <inputs> <outputs>");
+        }
+        const outArr = Object.entries(outputs as Record<string, unknown>).map(([address, amount]) => ({
+          address,
+          amount: String(amount),
+        }));
+        const rawTx = {
+          inputs: (inputs as Array<{ txid?: unknown; vout?: unknown }>).map((input) => ({
+            txid: String(input.txid ?? ""),
+            index: Number(input.vout ?? 0),
+          })),
+          outputs: outArr,
+          fee: "0",
+        };
+        return encodeRawTxHex(rawTx);
+      }
+      case "fundrawtransaction": {
+        this.requireParams(params, 1, 1);
+        if (typeof params[0] !== "string") throw parameterError("fundrawtransaction requires hexstring");
+        return this.core.fundRawTransaction(params[0]);
+      }
+      case "decoderawtransaction": {
+        this.requireParams(params, 1, 1);
+        if (typeof params[0] !== "string") throw parameterError("decoderawtransaction requires hexstring");
+        return this.core.decodeRawTransaction(params[0]);
+      }
+      case "decodescript":
+        throw codedError(RPC_METHOD_NOT_FOUND, "decodescript is not supported: EDX has no script language");
+      case "sendrawtransaction": {
+        this.requireParams(params, 1, 1);
+        if (typeof params[0] !== "string") throw parameterError("sendrawtransaction requires hexstring");
+        return this.core.sendRawTransaction(params[0]);
+      }
+      case "testmempoolaccept": {
+        this.requireParams(params, 1, 1);
+        if (!Array.isArray(params[0])) throw parameterError("testmempoolaccept requires an array of hexstrings");
+        return this.core.testMempoolAccept(params[0]);
+      }
+      case "createpsbt":
+      case "decodepsbt":
+      case "combinepsbt":
+      case "finalizepsbt":
+        throw codedError(RPC_METHOD_NOT_FOUND, `${method} is not supported: EDX has no PSBT (BIP174) transactions`);
+
+      // ---- UTXO, mempool and fees ----
+      case "scantxoutset":
+        throw codedError(RPC_METHOD_NOT_FOUND, "scantxoutset is not supported: EDX has no output descriptors");
+      case "gettxout": {
+        this.requireParams(params, 2, 2);
+        const [txid, n] = params;
+        if (typeof txid !== "string" || typeof n !== "number") {
+          throw parameterError("gettxout requires <txid> <n>");
+        }
+        return this.core.getTxOut(txid, Math.floor(n));
+      }
+      case "gettxoutsetinfo":
+        return this.core.getTxOutSetInfo();
+      case "getrawmempool": {
+        const mempool = await this.core.getRawMempool();
+        return params[0] === true ? Object.fromEntries(mempool.map((txid) => [txid, { size: 250, fee: "0" }])) : mempool;
+      }
+      case "getmempoolentry": {
+        this.requireParams(params, 1, 1);
+        if (typeof params[0] !== "string") throw parameterError("getmempoolentry requires txid");
+        const txid = params[0];
+        const raw = await this.core.getRawTransaction(txid);
+        if (!raw) throw codedError(RPC_GENERIC, "Transaction not found in mempool");
+        return { txid, vsize: 250, fee: "0", depends: [] };
+      }
+      case "getmempoolinfo":
+        return this.core.getMempoolInfo();
+
+      // ---- blockchain and sync ----
+      case "getblockhash": {
+        this.requireParams(params, 1, 1);
+        if (typeof params[0] !== "number") throw parameterError("getblockhash requires <height>");
+        const hash = this.core.getBlockHash(Math.floor(params[0]));
+        if (!hash) throw codedError(RPC_GENERIC, "Block height out of range");
+        return hash;
+      }
+      case "getblockheader": {
+        this.requireParams(params, 1, 2);
+        if (typeof params[0] !== "string") throw parameterError("getblockheader requires <blockhash>");
+        const header = this.core.getBlockHeader(params[0]);
+        if (!header) throw codedError(RPC_GENERIC, "Block not found");
+        return params[1] === false ? header.hash : header;
+      }
+      case "getblock": {
+        this.requireParams(params, 1, 2);
+        if (typeof params[0] !== "string") throw parameterError("getblock requires <blockhash>");
+        const block = this.core.getBlock(params[0]);
+        if (!block) throw codedError(RPC_GENERIC, "Block not found");
+        return params[1] === 0 ? block.hash : block;
+      }
+      case "getchaintips": {
+        const chain = await this.core.getChainInfo();
+        return [{ height: chain.blocks, hash: chain.latestHash, branchlen: 0, status: "active" }];
+      }
+      case "getrawtransaction": {
+        this.requireParams(params, 1, 2);
+        if (typeof params[0] !== "string") throw parameterError("getrawtransaction requires txid");
+        const raw = await this.core.getRawTransaction(params[0]);
+        if (!raw) throw codedError(RPC_GENERIC, "Transaction not found");
+        return params[1] === true ? { hex: raw } : raw;
+      }
+
+      // ---- network connections and node control ----
+      case "getnetworkinfo": {
+        const count = this.core.getConnectionCount();
         return {
-          blocks: info.blocks,
-          difficulty: mining.difficulty,
-          networkhashps: mining.networkHashps,
-          pooledtx: info.pendingCount,
+          version: 1,
+          subversion: "/EDX:1.0/",
+          protocolversion: 70016,
+          connections: count,
+          relayfee: "0.00001000",
+        };
+      }
+      case "addnode": {
+        this.requireParams(params, 2, 2);
+        const [node, command] = params;
+        if (typeof node !== "string" || typeof command !== "string") {
+          throw parameterError("addnode requires <node> <command>");
+        }
+        if (command === "add") {
+          this.core.addNode(node);
+          return null;
+        }
+        if (command === "remove") {
+          this.core.removeNode(node);
+          return null;
+        }
+        throw parameterError("addnode command must be 'add' or 'remove'");
+      }
+      case "ping":
+        return null;
+
+      // ---- mining and block submission ----
+      case "getblocktemplate": {
+        const chain = await this.core.getChainInfo();
+        return {
+          capabilities: ["proposal"],
+          version: 1,
+          height: chain.blocks,
+          previousblockhash: chain.latestHash,
+          curtime: Math.floor(Date.now() / 1000),
+          bits: "1d00ffff",
+          target: "00000000ffff0000000000000000000000000000000000000000000000000000",
+          coinbasevalue: chain.blockReward,
+          transactions: [],
+        };
+      }
+      case "submitblock": {
+        this.requireParams(params, 1, 2);
+        if (typeof params[0] !== "string") {
+          throw parameterError("submitblock requires <hexdata> [dummy]");
+        }
+        // The block body is hex of UTF-8 JSON (the same convention as raw
+        // transactions). It is decoded into the consensus block shape and
+        // submitted to the connected node, which runs the real validation
+        // (merkle root, PoW, difficulty, timestamps, UTXO state) and persists
+        // the block on success. Bitcoind-style status strings are returned:
+        //   "duplicate"    - the block hash is already known
+        //   "inconclusive" - the block built on a side branch (fork)
+        //   "unknown"      - the payload could not be decoded
+        //   "rejected"     - the block failed consensus validation
+        const block = decodeBlockHex(params[0]);
+        if (!block) return "unknown";
+        const outcome = await submitBlock(this.core.conn, block);
+        switch (outcome.status) {
+          case "duplicate":
+            return "duplicate";
+          case "inconclusive":
+            return "inconclusive";
+          case "rejected":
+            return { status: "rejected", reject_reason: outcome.rejectReason ?? "unknown error" };
+          default:
+            // Accepted: the block extended the best chain (null, bitcoind convention).
+            return null;
+        }
+      }
+      case "generatetoaddress":
+        throw codedError(RPC_METHOD_NOT_FOUND, "generatetoaddress is not supported: no regtest block generation in EDX");
+
+      case "getmininginfo": {
+        const chain = await this.core.getChainInfo();
+        return {
+          blocks: chain.blocks,
+          difficulty: miningDifficulty(chain.networkPower),
+          networkhashps: chain.networkPower,
+          pooledtx: chain.pendingCount,
           chain: "edx",
         };
       }
       case "getnetworkhashps":
         return (await this.core.getMiningInfo()).networkHashps;
-      case "getminingjob":
-        return this.core.getMiningJob();
+      case "getminingjob": {
+        const chain = await this.core.getChainInfo();
+        const difficulty = miningDifficulty(chain.networkPower);
+        const target = ((1n << 256n) - 1n) / BigInt(difficulty);
+        return {
+          jobId: sha256Hex(`${chain.blocks}:${chain.latestHash}`),
+          height: chain.blocks,
+          previousblockhash: chain.latestHash,
+          curtime: Math.floor(Date.now() / 1000),
+          difficulty,
+          target: target.toString(16).padStart(64, "0"),
+          coinbasevalue: chain.blockReward,
+          version: 1,
+          noncerange: ["00000000", "ffffffff"],
+        };
+      }
       case "getminingstats": {
         const mining = await this.core.getMiningInfo();
         return {
@@ -223,4 +604,20 @@ function methodNotFound(method: string): Error {
 
 function codedError(code: number, message: string): Error {
   return Object.assign(new Error(message), { code });
+}
+
+/** Amount strings are EDX with up to 8 decimals. */
+function parseAmount(value: string): bigint {
+  const match = /^(\d+)(?:\.(\d{1,8}))?$/.exec(value.trim());
+  if (!match) return 0n;
+  return BigInt(match[1]!) * 100_000_000n + BigInt((match[2] ?? "").padEnd(8, "0") || "0");
+}
+
+function formatAmount(photons: bigint): string {
+  const s = photons.toString().padStart(9, "0");
+  return `${s.slice(0, -8)}.${s.slice(-8)}`;
+}
+
+function encodeRawTxHex(tx: unknown): string {
+  return Buffer.from(JSON.stringify(tx), "utf8").toString("hex");
 }

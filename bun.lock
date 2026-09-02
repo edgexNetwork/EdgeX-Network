@@ -46,6 +46,15 @@
         "react": "^18.3.1",
       },
     },
+    "demo/offline-sign": {
+      "name": "@edgex/offline-sign-demo",
+      "version": "0.1.0",
+      "dependencies": {
+        "@edgex/shared": "workspace:*",
+        "@scure/bip32": "^1.6.0",
+        "@scure/bip39": "^1.5.0",
+      },
+    },
     "packages/core": {
       "name": "@edgex/core",
       "version": "0.1.0",
@@ -64,6 +73,8 @@
     "@edgex/core": ["@edgex/core@workspace:packages/core"],
 
     "@edgex/node": ["@edgex/node@workspace:apps/node"],
+
+    "@edgex/offline-sign-demo": ["@edgex/offline-sign-demo@workspace:demo/offline-sign"],
 
     "@edgex/shared": ["@edgex/shared@workspace:packages/shared"],
 

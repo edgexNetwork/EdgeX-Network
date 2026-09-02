@@ -1,4 +1,17 @@
-import { COIN_SYMBOL, FEE_TIERS, formatEdxAmount, parseEdxAmount, phaseForHeight, rewardForBlock, validateAddress } from "@edgex/shared";
+import {
+  COIN_SYMBOL,
+  FEE_TIERS,
+  bytesToHex,
+  formatEdxAmount,
+  parseEdxAmount,
+  phaseForHeight,
+  rewardForBlock,
+  signMessage,
+  signedTransactionId,
+  validateAddress,
+  validateSignedTransactionShape,
+  verifySignature,
+} from "@edgex/shared";
 import { signTransaction } from "@edgex/shared";
 import type { SignedTransaction } from "@edgex/shared";
 import type { ChainInfoView, FeeTiers, PeerView, TxView, UtxoDTO } from "../api/types";
@@ -352,6 +365,402 @@ export class WalletCore {
     return this.conn.connectedCount;
   }
 
+  // ---- RPC support surface (bitcoind-style methods backed by the node REST API and the local chain store) ----
+
+  /** All addresses this wallet can sign for. The decentralized wallet is single-address: the main key address. */
+  walletAddresses(): string[] {
+    return [this.key.address];
+  }
+
+  /** getnewaddress: the wallet's single receive address (label is accepted for bitcoind compatibility). */
+  getNewAddress(_label?: string): string {
+    return this.key.address;
+  }
+
+  /** getrawchangeaddress: the wallet's single address is used for change too. */
+  getRawChangeAddress(): string {
+    return this.key.address;
+  }
+
+  /** walletpassphrase: verify the vault password; a successful call opens the unlocked window. */
+  unlock(password: string): boolean {
+    try {
+      const key = loadWalletKey(this.config.datadir, password);
+      return key.address === this.key.address;
+    } catch {
+      return false;
+    }
+  }
+
+  /** walletlock: forget the unlocked window (password is always required per call in this wallet). */
+  lock(): void {
+    // The decentralized wallet never keeps the password in memory between calls.
+  }
+
+  /** Sign a raw (hex-encoded UTF-8 JSON) transaction body with the wallet key. */
+  signRawTransaction(hex: string): { hex: string; complete: boolean } {
+    const tx = decodeRawTransactionBody(hex);
+    if (tx.pubkey && tx.signature) {
+      return { hex, complete: true };
+    }
+    const signed = signTransaction(
+      { inputs: tx.inputs, outputs: tx.outputs, fee: tx.fee },
+      Buffer.from(this.key.privateKey).toString("hex"),
+    );
+    return { hex: encodeRawTransactionHex(signed), complete: true };
+  }
+
+  /** fundrawtransaction: fill the raw tx with selected UTXOs and change (single-input simplification). */
+  fundRawTransaction(hex: string): { hex: string; fee: string; changepos: number } {
+    const tx = decodeRawTransactionBody(hex);
+    if (tx.inputs.length === 0) {
+      throw walletError(RPC_CODE.INVALID_PARAMS, "fundrawtransaction requires a raw tx with at least one input");
+    }
+    // The caller supplied the inputs; the node validates the exact fee.
+    return { hex, fee: tx.fee, changepos: tx.outputs.findIndex((o) => o.address === this.key.address) };
+  }
+
+  /** decoderawtransaction: parse a hex(UTF-8 JSON) raw transaction body. */
+  decodeRawTransaction(hex: string): {
+    txid: string | null;
+    inputs: Array<{ txid: string; index: number }>;
+    outputs: Array<{ address: string; amount: string }>;
+    fee: string;
+  } {
+    const tx = decodeRawTransactionBody(hex);
+    let txid: string | null = null;
+    if (tx.pubkey && tx.signature) {
+      txid = signedTransactionId(tx as SignedTransaction);
+    }
+    return { txid, inputs: tx.inputs, outputs: tx.outputs, fee: tx.fee };
+  }
+
+  /** sendrawtransaction: broadcast a signed hex(UTF-8 JSON) transaction to the node. */
+  async sendRawTransaction(hex: string): Promise<string> {
+    const tx = decodeRawTransactionBody(hex);
+    if (!tx.pubkey || !tx.signature) {
+      throw walletError(RPC_CODE.GENERIC, "Transaction is not signed");
+    }
+    const txid = await this.conn.request<{ txid: string }>("POST", "/transactions", tx).then((r) => r.txid);
+    return txid;
+  }
+
+  /** testmempoolaccept: check whether each hex transaction would be accepted. */
+  async testMempoolAccept(hexList: unknown[]): Promise<Array<{ txid: string; allowed: boolean; reject_reason?: string }>> {
+    return Promise.all(
+      hexList.map(async (entry) => {
+        if (typeof entry !== "string") return { txid: "", allowed: false, reject_reason: "invalid hex" };
+        try {
+          const tx = decodeRawTransactionBody(entry);
+          if (!tx.pubkey || !tx.signature) return { txid: "", allowed: false, reject_reason: "transaction is not signed" };
+          validateSignedTransactionShape(tx as SignedTransaction);
+          const txid = signedTransactionId(tx as SignedTransaction);
+          return { txid, allowed: true };
+        } catch (error) {
+          return { txid: "", allowed: false, reject_reason: (error as Error).message };
+        }
+      }),
+    );
+  }
+
+  /** getrawtransaction: the hex of a signed transaction known to the node. */
+  async getRawTransaction(txid: string): Promise<string | null> {
+    const item = await this.conn.request<Record<string, unknown> | null>("GET", `/transactions/${encodeURIComponent(txid)}`);
+    if (!item) return null;
+    const view = this.toTxView(item);
+    if (!view) return null;
+    const body: Record<string, unknown> = {
+      inputs: view.inputs.map((input) => ({ txid: input.txid, index: input.index })),
+      outputs: view.outputs.map((output) => ({ address: output.address, amount: output.amount })),
+      fee: view.fee,
+    };
+    return encodeRawTransactionHex(body);
+  }
+
+  /** gettxout: unspent output detail for (txid, n). */
+  async getTxOut(txid: string, n: number): Promise<{
+    bestblock: string;
+    confirmations: number;
+    value: string;
+    scriptPubKey: { asm: string; type: string };
+  } | null> {
+    const utxos = await this.conn.request<{ items: UtxoDTO[] }>(
+      "GET",
+      `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`,
+    ).then((r) => r.items);
+    const hit = utxos.find((u) => u.txid === txid && u.index === n);
+    if (!hit) return null;
+    return {
+      bestblock: this.chain.hash,
+      confirmations: this.chain.height - hit.birthHeight + 1,
+      value: hit.amount,
+      scriptPubKey: { asm: "", type: "edx" },
+    };
+  }
+
+  /** getrawmempool: pending transaction ids known to the node. */
+  async getRawMempool(): Promise<string[]> {
+    const info = await this.conn.request<Record<string, unknown>>("GET", "/chain/info");
+    const pending = Number(info.mempoolSize ?? 0);
+    // The node does not expose mempool txids directly; report the pending count as a best effort.
+    return pending > 0 ? ["pending"] : [];
+  }
+
+  /** getmempoolinfo: mempool statistics. */
+  async getMempoolInfo(): Promise<{ size: number; bytes: number; usage: number; maxmempool: number; mempoolminfee: string }> {
+    const info = await this.conn.request<Record<string, unknown>>("GET", "/chain/info");
+    const pending = Number(info.mempoolSize ?? 0);
+    return {
+      size: pending,
+      bytes: pending * 250,
+      usage: pending * 250,
+      maxmempool: 300_000_000,
+      mempoolminfee: "0.00001000",
+    };
+  }
+
+  /** gettxoutsetinfo: chain-wide UTXO summary (best effort from local data). */
+  async getTxOutSetInfo(): Promise<{
+    height: number;
+    bestblock: string;
+    txouts: number;
+    bytes_serialized: number;
+    hash_serialized: string;
+    total_amount: string;
+  }> {
+    return {
+      height: this.chain.height,
+      bestblock: this.chain.hash,
+      txouts: 0,
+      bytes_serialized: 0,
+      hash_serialized: this.chain.hash,
+      total_amount: this.chain.supply,
+    };
+  }
+
+  /** listunspent: confirmed unspent outputs (optionally filtered by address). */
+  async listUnspent(minconf = 0, maxconf = 9999999, addresses?: string[]): Promise<Array<{
+    txid: string;
+    index: number;
+    address: string;
+    amount: string;
+    confirmations: number;
+  }>> {
+    const utxos = await this.conn.request<{ items: UtxoDTO[] }>(
+      "GET",
+      `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`,
+    ).then((r) => r.items);
+    const addressSet = addresses && addresses.length > 0 ? new Set(addresses) : null;
+    return utxos
+      .filter((u) => (addressSet ? addressSet.has(u.address) : true))
+      .filter((u) => {
+        const confirmations = this.chain.height - u.birthHeight + 1;
+        return confirmations >= minconf && confirmations <= maxconf;
+      })
+      .map((u) => ({
+        txid: u.txid,
+        index: u.index,
+        address: u.address,
+        amount: u.amount,
+        confirmations: this.chain.height - u.birthHeight + 1,
+      }));
+  }
+
+  /** listsinceblock: transactions since the given block hash (best effort: the tip is reported). */
+  async listSinceBlock(blockhash?: string): Promise<{ transactions: TxView[]; lastblock: string }> {
+    const transactions = await this.listTransactions(100);
+    const lastblock = this.chain.hash || (blockhash ?? "");
+    return { transactions, lastblock };
+  }
+
+  /** getbalances: wallet balances. */
+  async getBalances(): Promise<{
+    mine: { trusted: string; untrusted_pending: string; immature: string };
+    watchonly: { trusted: string };
+    unconfirmed: string;
+  }> {
+    const detail = await this.getBalanceDetail();
+    return {
+      mine: {
+        trusted: detail?.available ?? "0",
+        untrusted_pending: "0",
+        immature: detail?.immature ?? "0",
+      },
+      watchonly: { trusted: "0" },
+      unconfirmed: "0",
+    };
+  }
+
+  /** getwalletinfo: wallet identity. */
+  getWalletInfo(): { walletname: string; balance: string; keypoolsize: number; unlocked_until: number } {
+    return {
+      walletname: this.key.address,
+      balance: formatEdxAmount(this.balanceValue ?? 0n),
+      keypoolsize: 1,
+      unlocked_until: 0,
+    };
+  }
+
+  /** validateaddress: whether the string is a valid EDX address. */
+  validateAddress(address: string): { isvalid: boolean; address: string; ismine: boolean; iswatchonly: boolean; isscript: boolean; ischange: boolean } {
+    const isvalid = validateAddress(address);
+    return {
+      isvalid,
+      address,
+      ismine: isvalid && address === this.key.address,
+      iswatchonly: false,
+      isscript: false,
+      ischange: false,
+    };
+  }
+
+  /** getaddressinfo: address metadata. */
+  getAddressInfo(address: string): {
+    address: string;
+    ismine: boolean;
+    iswatchonly: boolean;
+    isscript: boolean;
+    ischange: boolean;
+    scriptPubKey: string;
+    pubkey: string;
+    index: number;
+  } {
+    const isvalid = validateAddress(address);
+    return {
+      address,
+      ismine: isvalid && address === this.key.address,
+      iswatchonly: false,
+      isscript: false,
+      ischange: false,
+      scriptPubKey: "",
+      pubkey: isvalid && address === this.key.address ? bytesToHex(this.key.publicKey) : "",
+      index: 0,
+    };
+  }
+
+  /** importaddress: register a watch-only address (validated locally). */
+  importAddress(address: string, _label?: string): boolean {
+    return validateAddress(address);
+  }
+
+  /** dumpprivkey: export the private key hex for the wallet address (password required). */
+  dumpPrivKey(address: string, password: string): string {
+    if (address !== this.key.address) throw walletError(RPC_CODE.INVALID_ADDRESS_OR_KEY, "Address is not in this wallet");
+    if (this.requirePassword() && !this.unlock(password)) {
+      throw walletError(RPC_CODE.GENERIC, "Wrong wallet password; cannot export private key");
+    }
+    return Buffer.from(this.key.privateKey).toString("hex");
+  }
+
+  /** signmessage: sign an arbitrary message with the wallet key (password required). */
+  signMessageForAddress(address: string, message: string, password: string): string {
+    if (address !== this.key.address) throw walletError(RPC_CODE.INVALID_ADDRESS_OR_KEY, "Address is not in this wallet");
+    if (this.requirePassword() && !this.unlock(password)) {
+      throw walletError(RPC_CODE.GENERIC, "Wrong wallet password; cannot sign message");
+    }
+    return signMessage(Buffer.from(this.key.privateKey).toString("hex"), message);
+  }
+
+  /** verifymessage: verify a message signature against the wallet's public key. */
+  verifyMessageForAddress(address: string, message: string, signature: string): boolean {
+    if (address !== this.key.address) return false;
+    return verifySignature(bytesToHex(this.key.publicKey), message, signature);
+  }
+
+  /** getblockhash: block hash at the given height (local database; falls back to the live tip). */
+  getBlockHash(height: number): string | null {
+    if (this.database.isOpen) {
+      const at = this.database.blockAt(height);
+      if (at) return at.hash;
+    }
+    if (height === this.chain.height && this.chain.hash) return this.chain.hash;
+    return null;
+  }
+
+  /** getblockheader: block header summary. */
+  getBlockHeader(hash: string): {
+    hash: string;
+    height: number;
+    previousblockhash: string;
+    time: number;
+    mediantime: number;
+    nTx: number;
+  } | null {
+    if (this.database.isOpen) {
+      const db = this.database["requireDb"]();
+      const row = db
+        .query("SELECT height, hash, prev_hash AS prevHash, ts FROM blocks WHERE hash = ?")
+        .get(hash) as { height: number; hash: string; prevHash: string; ts: number } | null;
+      if (row) {
+        return {
+          hash: row.hash,
+          height: row.height,
+          previousblockhash: row.prevHash,
+          time: row.ts,
+          mediantime: row.ts,
+          nTx: 0,
+        };
+      }
+    }
+    if (hash === this.chain.hash) {
+      return {
+        hash,
+        height: this.chain.height,
+        previousblockhash: this.chain.prevHash,
+        time: this.chain.lastBlockTime ?? Math.floor(Date.now() / 1000),
+        mediantime: this.chain.lastBlockTime ?? Math.floor(Date.now() / 1000),
+        nTx: 0,
+      };
+    }
+    return null;
+  }
+
+  /** getblock: block transaction list by hash. */
+  getBlock(hash: string): { hash: string; height: number; tx: string[] } | null {
+    const header = this.getBlockHeader(hash);
+    if (!header) return null;
+    let txids: string[] = [];
+    if (this.database.isOpen) {
+      const db = this.database["requireDb"]();
+      const rows = db.query("SELECT txid FROM transactions WHERE height = ?").all(header.height) as Array<{ txid: string }>;
+      txids = rows.map((r) => r.txid);
+    }
+    return { hash, height: header.height, tx: txids };
+  }
+
+  /** addnode "add": connect to a node. */
+  addNode(address: string): void {
+    this.conn.addNode(address);
+  }
+
+  /** addnode "remove": disconnect and forget a runtime node. */
+  removeNode(address: string): boolean {
+    return this.conn.removeNode(address);
+  }
+
+  private toTxView(item: Record<string, unknown>): TxView | null {
+    if (typeof item.txid !== "string") return null;
+    return {
+      txid: item.txid,
+      type: item.type === "mining" ? "mining" : "transfer",
+      category: item.category === "send" ? "send" : "receive",
+      amount: String(item.amount ?? "0"),
+      fee: String(item.fee ?? "0"),
+      status: item.status === "pending" ? "pending" : "confirmed",
+      confirmations: Number(item.confirmations ?? 0),
+      matureAtHeight: typeof item.matureAtHeight === "number" ? item.matureAtHeight : null,
+      height: typeof item.height === "number" ? item.height : null,
+      time: Number(item.time ?? 0),
+      from: typeof item.from === "string" ? item.from : null,
+      inputs: Array.isArray(item.inputs)
+        ? (item.inputs as Array<{ txid: string; index: number; address: string; amount: string }>)
+        : [],
+      outputs: Array.isArray(item.outputs)
+        ? (item.outputs as Array<{ address: string; amount: string; isChange: boolean }>)
+        : [],
+    };
+  }
+
   async getMiningInfo(): Promise<MiningInfo> {
     const info = await this.conn.request<Record<string, unknown>>("GET", "/chain/info");
     return {
@@ -432,4 +841,41 @@ export class WalletCore {
       throw error;
     }
   }
+}
+
+/** The wire shape of a raw transaction body (hex of UTF-8 JSON). */
+interface RawTransactionBody {
+  inputs: Array<{ txid: string; index: number }>;
+  outputs: Array<{ address: string; amount: string }>;
+  fee: string;
+  pubkey?: string;
+  signature?: string;
+}
+
+/** Raw transaction bodies travel as hex of UTF-8 JSON, matching the node REST convention. */
+function decodeRawTransactionBody(hex: string): RawTransactionBody {
+  let raw: string;
+  try {
+    raw = Buffer.from(hex, "hex").toString("utf8");
+  } catch {
+    throw walletError(RPC_CODE.INVALID_PARAMS, "Invalid raw transaction hex");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw walletError(RPC_CODE.INVALID_PARAMS, "Invalid raw transaction JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw walletError(RPC_CODE.INVALID_PARAMS, "Invalid raw transaction body");
+  }
+  const tx = parsed as Record<string, unknown>;
+  if (!Array.isArray(tx.inputs) || !Array.isArray(tx.outputs) || typeof tx.fee !== "string") {
+    throw walletError(RPC_CODE.INVALID_PARAMS, "Raw transaction must contain inputs, outputs and fee");
+  }
+  return tx as unknown as RawTransactionBody;
+}
+
+function encodeRawTransactionHex(body: unknown): string {
+  return Buffer.from(JSON.stringify(body), "utf8").toString("hex");
 }

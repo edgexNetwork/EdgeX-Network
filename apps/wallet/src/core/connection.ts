@@ -95,6 +95,19 @@ export class ConnectionManager {
     return state.view;
   }
 
+  /** Removes a runtime-added node (bitcoind addnode "remove"): closes its links and forgets it. */
+  removeNode(address: string): boolean {
+    const normalized = normalizePeer(address);
+    const key = dedupeKey(normalized);
+    const state = this.states.get(key);
+    if (!state) return false;
+    for (const link of state.links) link.close();
+    this.states.delete(key);
+    this.recount();
+    this.persistRuntimePeers();
+    return true;
+  }
+
   async refreshConnection(): Promise<boolean> {
     const results = await Promise.all([...this.states.values()].map((state) => this.probePeer(state)));
     this.connectedCount = results.filter(Boolean).length;
