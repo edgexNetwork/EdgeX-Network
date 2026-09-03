@@ -94,6 +94,50 @@ above) or to a wallet RPC `sendrawtransaction` with the hex string. The node
 recomputes `transactionId(signed)` and validates the signature against `pubkey`
 before accepting it into the mempool.
 
+## Reimplementing the signer elsewhere
+
+Everything needed to reproduce this demo is described above, and nothing depends
+on this repository:
+
+1. Derive the key. From a BIP39 mnemonic, compute the seed
+   (`PBKDF2-HMAC-SHA512`, 2048 rounds, salt `"mnemonic"`) and derive the node at
+   path `m/44'/778'/0'/0/0` (BIP44 with coin type 778). Use the compressed
+   33-byte public key.
+2. Compute the address: `Base58Check(0x21 || hash160(compressedPubkey))` where
+   `hash160(x) = RIPEMD160(SHA-256(x))` and the Base58Check checksum is the
+   first four bytes of `SHA-256(SHA-256(version || payload))`. See section 5.
+3. Build the signing message from the transaction (`input:` lines, one `fee:`
+   line, output lines; joined with `\n`). See section 1.
+4. Compute `digest = SHA-256(message)` and sign it with ECDSA-SECP256K1 in
+   compact (r || s) form. See sections 2-3.
+5. Compute `txid = SHA-256(message + "\n" + signature)`. See section 4.
+6. Serialize `{ inputs, outputs, fee, pubkey, signature }` as UTF-8 JSON and
+   hex-encode it. That single string is the broadcastable value.
+
+Any language with SHA-256, RIPEMD-160, Base58Check and secp256k1 can produce an
+identical, interoperable signature from the same transaction.
+
+## Finding the UTXOs to spend
+
+The signer is fully offline, but it still needs to know which unspent outputs
+fund the transaction. Ask a wallet or a full node (never the offline signer):
+
+- Wallet JSON-RPC — full-chain UTXO scan of an arbitrary address:
+  `scantxoutset ["start", ["addr(<address>)"]]`, which returns
+  `{ success, txouts, total_amount, unspents: [{ txid, vout, address, amount, confirmations, scriptPubKey }] }`.
+- Full-node REST — `GET /wallet/utxos?address=<address>` returns
+  `{ items: [{ txid, index, address, amount, birthHeight, isCoinbase, spendable }] }`.
+
+Spend the returned outputs (`vout`/`index` is the output index used in the
+signing message).
+
+## Broadcasting the signed transaction
+
+- Wallet JSON-RPC: `sendrawtransaction <hex>` returns the txid; poll
+  `getrawtransaction <txid> true` until `confirmations > 0`.
+- Full-node REST: `POST /transactions` with the JSON body (the same object the
+  hex encodes); it returns `{ accepted, txid }`.
+
 ## Running the demo
 
 ```bash

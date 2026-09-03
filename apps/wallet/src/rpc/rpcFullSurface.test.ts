@@ -43,9 +43,7 @@ const ADDRESS = "Ea455DTrfM5CZ1kFfg8Jgntp8Qbx8kjt7f";
 
 /** A fake ConnectionManager that answers node REST routes with canned data. */
 function fakeConn(overrides: Record<string, unknown> = {}): ConnectionManager {
-  const utxosPath = `/wallet/utxos?address=${encodeURIComponent(ADDRESS)}`;
-  const historyPath = `/wallet/history?address=${encodeURIComponent(ADDRESS)}&limit=20`;
-  const routes: Record<string, unknown> = {
+  const baseRoutes: Record<string, unknown> = {
     "/chain/info": {
       height: 12,
       bestHash: "b".repeat(64),
@@ -55,11 +53,6 @@ function fakeConn(overrides: Record<string, unknown> = {}): ConnectionManager {
       networkHashps: 66_667,
       networkPower: 66_667,
       genesisHash: GENESIS_BLOCK.hash,
-    },
-    [utxosPath]: {
-      items: [
-        { txid: "c".repeat(64), index: 0, address: ADDRESS, amount: "100.00000000", birthHeight: 6, isCoinbase: false, spendable: true },
-      ],
     },
     [`/transactions/${"d".repeat(64)}`]: {
       txid: "d".repeat(64),
@@ -76,7 +69,17 @@ function fakeConn(overrides: Record<string, unknown> = {}): ConnectionManager {
       inputs: [{ txid: "c".repeat(64), index: 0, address: ADDRESS, amount: "100.00000000" }],
       outputs: [{ address: ADDRESS, amount: "89.99990000", isChange: true }],
     },
-    [historyPath]: [
+  };
+  // The wallet key address, plus a second, foreign address (for scan coverage).
+  for (const address of [ADDRESS, "Ea455DTrfM5CZ1kFfg8Jgntp8Qbx8kjt7f".replace("kjt7f", "kjt70")]) {
+    const utxosPath = `/wallet/utxos?address=${encodeURIComponent(address)}`;
+    const historyPath = `/wallet/history?address=${encodeURIComponent(address)}&limit=20`;
+    baseRoutes[utxosPath] = {
+      items: [
+        { txid: "c".repeat(64), index: 0, address, amount: "100.00000000", birthHeight: 6, isCoinbase: false, spendable: true },
+      ],
+    };
+    baseRoutes[historyPath] = [
       {
         txid: "d".repeat(64),
         type: "transfer",
@@ -88,13 +91,13 @@ function fakeConn(overrides: Record<string, unknown> = {}): ConnectionManager {
         matureAtHeight: null,
         height: 9,
         time: 1_767_225_700,
-        from: ADDRESS,
-        inputs: [{ txid: "c".repeat(64), index: 0, address: ADDRESS, amount: "100.00000000" }],
-        outputs: [{ address: ADDRESS, amount: "89.99990000", isChange: true }],
+        from: address,
+        inputs: [{ txid: "c".repeat(64), index: 0, address, amount: "100.00000000" }],
+        outputs: [{ address, amount: "89.99990000", isChange: true }],
       },
-    ],
-    ...overrides,
-  };
+    ];
+  }
+  const routes = { ...baseRoutes, ...overrides };
   return {
     request: async (method: "GET" | "POST", path: string) => {
       if (method === "POST" && path === "/transactions") return { accepted: true, txid: "e".repeat(64) };
@@ -202,6 +205,24 @@ function stubCore(conn: ConnectionManager): WalletCore {
     sendRawTransaction: async () => "e".repeat(64),
     testMempoolAccept: async () => [{ txid: "e".repeat(64), allowed: true }],
     getRawTransaction: async () => "00",
+    getRawTransactionVerbose: async () => ({
+      txid: "d".repeat(64),
+      hex: "00",
+      in_active_chain: true,
+      inputs: [{ txid: "c".repeat(64), vout: 0, address: ADDRESS, amount: "100.00000000" }],
+      outputs: [{ address: ADDRESS, amount: "89.99990000", isChange: true }],
+      fee: "0.00010000",
+      confirmations: 3,
+      blockhash: "b".repeat(64),
+      blocktime: 1_767_225_700,
+      time: 1_767_225_700,
+    }),
+    scanTxOutSet: async () => ({
+      success: true,
+      txouts: 1,
+      total_amount: "100.00000000",
+      unspents: [{ txid: "c".repeat(64), vout: 0, address: ADDRESS, amount: "100.00000000", confirmations: 7, scriptPubKey: "" }],
+    }),
     getTxOut: async () => ({ bestblock: "b".repeat(64), confirmations: 7, value: "100.00000000", scriptPubKey: { asm: "", type: "edx" } }),
     getTxOutSetInfo: async () => ({ height: 12, bestblock: "b".repeat(64), txouts: 0, bytes_serialized: 0, hash_serialized: "b".repeat(64), total_amount: "4800.00000000" }),
     getRawMempool: async () => ["x".repeat(64)],
@@ -266,7 +287,9 @@ describe("wallet RPC full surface", () => {
     const { server } = makeServer();
     const tx = await rpcCall(server, "gettransaction", ["d".repeat(64)]);
     expect((tx.result as Record<string, unknown>).txid).toBe("d".repeat(64));
-    expect((await rpcCall(server, "gettransaction", ["not-found"])).result).toBeNull();
+    // Wallet-scoped semantics: an unknown / third-party id is an error (-5).
+    const missing = await rpcCall(server, "gettransaction", ["not-found"]);
+    expect(missing.error?.code).toBe(-5);
     expect(Array.isArray((await rpcCall(server, "listtransactions", [10])).result)).toBe(true);
     const fees = await rpcCall(server, "estimatesmartfee");
     expect((fees.result as Record<string, unknown>).recommended).toBe("normal");
@@ -360,7 +383,14 @@ describe("wallet RPC full surface", () => {
     expect((await rpcCall(server, "getmempoolinfo")).result).toBeDefined();
     const entry = await rpcCall(server, "getmempoolentry", ["x".repeat(64)]);
     expect(entry.result).toBeDefined();
-    expect((await rpcCall(server, "scantxoutset", [])).error?.code).toBe(-32601);
+    // scantxoutset now scans arbitrary addresses instead of being rejected.
+    const scan = await rpcCall(server, "scantxoutset", ["start", [`addr(${ADDRESS})`]]);
+    expect((scan.result as Record<string, unknown>).success).toBe(true);
+    expect((scan.result as Record<string, unknown>).txouts).toBe(1);
+    // abort/status return the synchronous-scan state.
+    expect(((await rpcCall(server, "scantxoutset", ["abort"])).result as Record<string, unknown>).success).toBe(false);
+    // A missing action is a parameter error, not a method-not-found error.
+    expect((await rpcCall(server, "scantxoutset", [])).error?.code).toBe(-32602);
     server.stop();
   });
 
@@ -373,8 +403,16 @@ describe("wallet RPC full surface", () => {
     const block = await rpcCall(server, "getblock", ["b".repeat(64)]);
     expect((block.result as Record<string, unknown>).height).toBe(12);
     expect((await rpcCall(server, "getchaintips")).result).toBeDefined();
+    // Non-verbose getrawtransaction returns the raw hex body.
     const rawTx = await rpcCall(server, "getrawtransaction", ["d".repeat(64)]);
     expect(rawTx.result).toBe("00");
+    // Verbose=true returns the structured full-chain view with confirmations.
+    const verbose = await rpcCall(server, "getrawtransaction", ["d".repeat(64), true]);
+    const verboseResult = verbose.result as Record<string, unknown>;
+    expect(verboseResult.txid).toBe("d".repeat(64));
+    expect(verboseResult.confirmations).toBe(3);
+    expect(verboseResult.in_active_chain).toBe(true);
+    expect(Array.isArray(verboseResult.outputs)).toBe(true);
     server.stop();
   });
 

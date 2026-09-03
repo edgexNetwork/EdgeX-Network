@@ -353,8 +353,19 @@ export class WalletCore {
     return this.transactions;
   }
 
+  /** gettransaction: a transaction that involves this wallet (send or receive). */
   async getTransaction(txid: string): Promise<TxView | null> {
-    return this.conn.request<TxView | null>("GET", `/transactions/${encodeURIComponent(txid)}`);
+    const view = await this.conn.request<TxView | null>("GET", `/transactions/${encodeURIComponent(txid)}`);
+    if (!view) return null;
+    // Wallet-scoped semantics: only transactions that touch the wallet address
+    // are returned; anything else on the chain is invisible here (full-chain
+    // lookups belong to getrawtransaction).
+    const own = this.key.address;
+    const involvesWallet =
+      view.from === own ||
+      view.inputs.some((input) => input.address === own) ||
+      view.outputs.some((output) => output.address === own);
+    return involvesWallet ? view : null;
   }
 
   getPeers(): PeerView[] {
@@ -495,6 +506,120 @@ export class WalletCore {
       confirmations: this.chain.height - hit.birthHeight + 1,
       value: hit.amount,
       scriptPubKey: { asm: "", type: "edx" },
+    };
+  }
+
+  /** Scan unspent outputs of arbitrary addresses (bitcoind scantxoutset semantics). */
+  async scanTxOutSet(scanobjects: unknown[]): Promise<{
+    success: boolean;
+    txouts: number;
+    total_amount: string;
+    unspents: Array<{
+      txid: string;
+      vout: number;
+      address: string;
+      amount: string;
+      confirmations: number;
+      scriptPubKey: string;
+    }>;
+  }> {
+    // EDX has no output descriptor language: an address is the spending
+    // condition, so both "addr(<address>)" and a bare address are accepted.
+    const addresses: string[] = [];
+    for (const obj of scanobjects) {
+      if (typeof obj !== "string") continue;
+      const match = /^addr\((.+)\)$/.exec(obj.trim());
+      const candidate = match ? match[1]! : obj.trim();
+      if (validateAddress(candidate)) addresses.push(candidate);
+    }
+    if (addresses.length === 0) {
+      throw walletError(
+        RPC_CODE.INVALID_PARAMS,
+        "scantxoutset requires at least one valid addr(<address>) scanobject",
+      );
+    }
+    // The wallet can scan any address, not just its own: the node answers
+    // /wallet/utxos for every valid address from the full chain state.
+    const seen = new Set<string>();
+    const unspents: Array<{
+      txid: string;
+      vout: number;
+      address: string;
+      amount: string;
+      confirmations: number;
+      scriptPubKey: string;
+    }> = [];
+    for (const address of addresses) {
+      const utxos = await this.conn
+        .request<{ items: UtxoDTO[] }>("GET", `/wallet/utxos?address=${encodeURIComponent(address)}`)
+        .then((result) => result.items);
+      for (const utxo of utxos) {
+        const key = `${utxo.txid}:${utxo.index}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unspents.push({
+          txid: utxo.txid,
+          vout: utxo.index,
+          address: utxo.address,
+          amount: utxo.amount,
+          confirmations: this.chain.height - utxo.birthHeight + 1,
+          scriptPubKey: "",
+        });
+      }
+    }
+    const totalPhotons = unspents.reduce((sum, unspent) => sum + parseEdxAmount(unspent.amount), 0n);
+    return {
+      success: true,
+      txouts: unspents.length,
+      total_amount: formatEdxAmount(totalPhotons),
+      unspents,
+    };
+  }
+
+  /** getrawtransaction verbose=true: a structured view of any on-chain transaction. */
+  async getRawTransactionVerbose(txid: string): Promise<{
+    txid: string;
+    hex: string;
+    in_active_chain: boolean;
+    inputs: Array<{ txid: string; vout: number; address: string; amount: string }>;
+    outputs: Array<{ address: string; amount: string; isChange: boolean }>;
+    fee: string;
+    confirmations: number;
+    blockhash: string | null;
+    blocktime: number;
+    time: number;
+  } | null> {
+    const view = await this.conn.request<Record<string, unknown> | null>("GET", `/transactions/${encodeURIComponent(txid)}`);
+    if (!view) return null;
+    const txView = this.toTxView(view);
+    if (!txView) return null;
+    // The node answers /transactions/<txid> for every transaction on the
+    // active chain, so this lookup is not limited to the wallet's own history.
+    const hex = encodeRawTransactionHex({
+      inputs: txView.inputs.map((input) => ({ txid: input.txid, index: input.index })),
+      outputs: txView.outputs.map((output) => ({ address: output.address, amount: output.amount })),
+      fee: txView.fee,
+    });
+    const blockhash =
+      txView.height !== null && this.database.isOpen
+        ? (this.database.blockAt(txView.height)?.hash ?? null)
+        : null;
+    return {
+      txid,
+      hex,
+      in_active_chain: txView.status === "confirmed",
+      inputs: txView.inputs.map((input) => ({
+        txid: input.txid,
+        vout: input.index,
+        address: input.address,
+        amount: input.amount,
+      })),
+      outputs: txView.outputs,
+      fee: txView.fee,
+      confirmations: txView.confirmations,
+      blockhash,
+      blocktime: blockhash ? txView.time : 0,
+      time: txView.time,
     };
   }
 

@@ -11,6 +11,7 @@ const RPC_METHOD_NOT_FOUND = -32601;
 const RPC_INVALID_PARAMS = -32602;
 const RPC_INTERNAL_ERROR = -32603;
 const RPC_GENERIC = -1;
+const RPC_INVALID_ADDRESS_OR_KEY = -5;
 
 interface JsonRpcRequest {
   jsonrpc?: unknown;
@@ -177,8 +178,14 @@ export class WalletRpcServer {
       case "gettransaction": {
         this.requireParams(params, 1, 1);
         if (typeof params[0] !== "string") throw parameterError("gettransaction requires a txid");
+        // Wallet-scoped semantics: unknown ids and third-party transactions
+        // that never touched this wallet are reported as an error (-5), the
+        // bitcoind convention. Full-chain lookups belong to getrawtransaction.
         const transaction = await this.core.getTransaction(params[0]);
-        return transaction ? transactionDto(transaction) : null;
+        if (!transaction) {
+          throw codedError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid or non-wallet transaction id");
+        }
+        return transactionDto(transaction);
       }
       case "listtransactions": {
         this.requireParams(params, 0, 2);
@@ -403,8 +410,20 @@ export class WalletRpcServer {
         throw codedError(RPC_METHOD_NOT_FOUND, `${method} is not supported: EDX has no PSBT (BIP174) transactions`);
 
       // ---- UTXO, mempool and fees ----
-      case "scantxoutset":
-        throw codedError(RPC_METHOD_NOT_FOUND, "scantxoutset is not supported: EDX has no output descriptors");
+      case "scantxoutset": {
+        // bitcoind semantics: "start <scanobjects>" scans the full-chain UTXO
+        // set for the given addresses; "abort" and "status" only report that
+        // the synchronous scan cannot be interrupted.
+        this.requireParams(params, 1, 2);
+        const [action, scanobjects] = params;
+        if (action === "abort" || action === "status") {
+          return { success: false, txouts: 0, total_amount: "0.00000000", unspents: [] };
+        }
+        if (action !== "start" || !Array.isArray(scanobjects)) {
+          throw parameterError("scantxoutset requires start <scanobjects> | abort | status");
+        }
+        return this.core.scanTxOutSet(scanobjects);
+      }
       case "gettxout": {
         this.requireParams(params, 2, 2);
         const [txid, n] = params;
@@ -457,11 +476,20 @@ export class WalletRpcServer {
         return [{ height: chain.blocks, hash: chain.latestHash, branchlen: 0, status: "active" }];
       }
       case "getrawtransaction": {
-        this.requireParams(params, 1, 2);
+        // bitcoind semantics: getrawtransaction <txid> [verbose] [blockhash].
+        // Without verbose the raw hex(UTF-8 JSON) body is returned; with
+        // verbose=true a structured view of any on-chain transaction comes back
+        // (full-chain lookup, not limited to this wallet's history).
+        this.requireParams(params, 1, 3);
         if (typeof params[0] !== "string") throw parameterError("getrawtransaction requires txid");
+        if (params[1] === true) {
+          const verbose = await this.core.getRawTransactionVerbose(params[0]);
+          if (!verbose) throw codedError(RPC_GENERIC, "Transaction not found");
+          return verbose;
+        }
         const raw = await this.core.getRawTransaction(params[0]);
         if (!raw) throw codedError(RPC_GENERIC, "Transaction not found");
-        return params[1] === true ? { hex: raw } : raw;
+        return raw;
       }
 
       // ---- network connections and node control ----
