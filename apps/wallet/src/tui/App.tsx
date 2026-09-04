@@ -172,6 +172,8 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [qr, setQr] = useState<string[] | null>(null);
   const [copyMsg, setCopyMsg] = useState<string | null>(null);
+  // Selected receive page address (index into core.walletAddresses()).
+  const [receiveIndex, setReceiveIndex] = useState(0);
   const sessionIdRef = useRef(1);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -276,7 +278,11 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
 
   useEffect(() => {
     let cancelled = false;
-    void qrLines(core.getAddress())
+    // The QR code always mirrors the address currently selected on the receive page.
+    const addresses = core.walletAddresses();
+    const list = addresses.length > 0 ? addresses : [core.getAddress()];
+    const target = list[receiveIndex] ?? list[0] ?? core.getAddress();
+    void qrLines(target)
       .then((lines) => {
         if (!cancelled) setQr(lines);
       })
@@ -284,7 +290,7 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
     return () => {
       cancelled = true;
     };
-  }, [core]);
+  }, [core, receiveIndex]);
 
 
   useEffect(() => {
@@ -341,13 +347,34 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
 
   const copyAddress = () => {
     void (async () => {
-      const ok = await copyToClipboard(core.getAddress());
+      const addresses = core.walletAddresses();
+      const list = addresses.length > 0 ? addresses : [core.getAddress()];
+      const target = list[receiveIndex] ?? list[0] ?? core.getAddress();
+      const ok = await copyToClipboard(target);
       setCopyMsg(
         ok ? t("ui.copyMsg") : "Copy failed: no clipboard tool found (press Ctrl+T to disable mouse and select to copy)",
       );
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
       copyTimerRef.current = setTimeout(() => setCopyMsg(null), 4000);
     })();
+  };
+
+  /** Switch the receive page to another derived address (wraps around). */
+  const selectReceiveAddress = (index: number) => {
+    const count = core.walletAddresses().length;
+    if (count === 0) return;
+    setReceiveIndex(((index % count) + count) % count);
+    setCopyMsg(null);
+  };
+
+  /** Derive a fresh receive address and select it on the receive page. */
+  const newReceiveAddress = () => {
+    const fresh = core.getNewAddress();
+    const list = core.walletAddresses();
+    const index = Math.max(0, list.indexOf(fresh));
+    setReceiveIndex(index);
+    setCopyMsg(null);
+    refresh();
   };
 
 
@@ -780,6 +807,8 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
       cols,
       mainH,
       address: core.getAddress(),
+      receiveAddresses: core.walletAddresses(),
+      receiveIndex: Math.min(receiveIndex, Math.max(0, core.walletAddresses().length - 1)),
       totalNodes: core.getPeers().length,
       selfP2pUrl: core.conn.selfPublicUrl(),
       requirePassword: core.requirePassword(),
@@ -797,6 +826,8 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
       addRow,
       delRow,
       showTx,
+      selectReceiveAddress,
+      newReceiveAddress,
       reconnect: () => {
         void core.conn.refreshConnection();
         refresh();

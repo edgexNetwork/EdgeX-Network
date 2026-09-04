@@ -127,6 +127,10 @@ export interface ViewSnapshot {
   cols: number;
   mainH: number;
   address: string;
+  /** Every derived wallet address (external + internal); the receive page switches over these. */
+  receiveAddresses: string[];
+  /** Index of the currently selected receive address within receiveAddresses. */
+  receiveIndex: number;
 
   selfP2pUrl: string;
 
@@ -154,6 +158,10 @@ export interface ViewActions {
 
   delRow: () => void;
   showTx: (txid: string) => void;
+  /** Switch the receive page to the address at the given index (wraps around). */
+  selectReceiveAddress: (index: number) => void;
+  /** Derive a fresh receive address and select it on the receive page. */
+  newReceiveAddress: () => void;
   reconnect: () => void;
   scrollBy: (d: number) => void;
 }
@@ -821,22 +829,50 @@ function sendView(snap: ViewSnapshot, actions: ViewActions): ViewResult {
 function receiveView(snap: ViewSnapshot, actions: ViewActions): ViewResult {
   const rows: Row[] = [];
   const regions: Region[] = [];
+  // The receive page works over every derived address; when the snapshot does
+  // not carry the list yet it falls back to the single main address.
+  const addresses = snap.receiveAddresses.length > 0 ? snap.receiveAddresses : [snap.address];
+  const count = addresses.length;
+  const index = Math.max(0, Math.min(snap.receiveIndex, count - 1));
+  const current = addresses[index] ?? snap.address;
   const copyBtn = `[${t("ui.copyAddress")}]`;
-  rows.push(boxTop(snap.cols, t("receive.title")));
+
+  rows.push(boxTop(snap.cols, `${t("receive.title")}${count > 1 ? ` ${t("receive.addrCount", { n: index + 1, total: count })}` : ""}`));
   rows.push({
-    text: `${snap.address} ${copyBtn}`,
+    text: `${current} ${copyBtn}`,
     segments: closeEdge([
-      { text: snap.address, bold: true, color: C.cyan },
+      { text: current, bold: true, color: C.cyan },
       { text: " ", color: undefined },
       { text: "[", color: C.border, bg: C.bg, bold: true },
       { text: t("ui.copyAddress"), color: C.fg, bg: C.bg, bold: true },
       { text: "]", color: C.border, bg: C.bg, bold: true },
     ], snap.cols),
   });
-
-
-  const copyX0 = w2(snap.address) + 1;
+  const copyX0 = w2(current) + 1;
   regions.push({ y: 1, x0: copyX0, x1: copyX0 + w2(copyBtn) - 1, action: actions.copyAddress });
+
+  // Every derived address, newest last; clicking a row switches to it.
+  if (count > 1) {
+    rows.push({ text: "", color: C.grayDim });
+    rows.push(boxTop(snap.cols, t("receive.allAddresses")));
+    addresses.forEach((address, i) => {
+      const mark = i === index ? `${t("receive.currentMark")} ` : "";
+      const label = `${String(i + 1).padStart(2, "0")} ${mark}${address}`;
+      const row = rows.length;
+      rows.push({
+        text: label,
+        segments: closeEdge([
+          { text: String(i + 1).padStart(2, "0"), color: C.grayDim },
+          { text: " ", color: undefined },
+          { text: mark, color: C.bright },
+          { text: address, bold: i === index, color: i === index ? C.cyan : C.fg },
+        ], snap.cols),
+      });
+      regions.push({ y: row, x0: 0, x1: viewWidth(snap.cols), action: () => actions.selectReceiveAddress(i) });
+    });
+    rows.push(boxBottom(snap.cols));
+  }
+
   rows.push(boxBottom(snap.cols));
   if (snap.copyMsg) rows.push({ text: snap.copyMsg, color: C.fg });
   if (snap.qr && snap.qr.length > 0) {
@@ -846,9 +882,23 @@ function receiveView(snap: ViewSnapshot, actions: ViewActions): ViewResult {
       rows.push({ text: `${" ".repeat(pad)}${line}`, dim: true });
     }
   }
-  const b = btn(rows.length, 0, `[${t("ui.refresh")}]`, actions.refresh);
-  rows.push(b.row);
-  regions.push(b.region);
+  const bNew = btn(rows.length, 0, `[${t("receive.newAddr")}]`, actions.newReceiveAddress);
+  rows.push(bNew.row);
+  regions.push(bNew.region);
+  let nextX = bNew.region.x1 + 1;
+  if (count > 1) {
+    const bPrev = btn(rows.length, nextX, `[${t("receive.prevAddr")}]`, () => actions.selectReceiveAddress(index - 1));
+    rows.push(bPrev.row);
+    regions.push(bPrev.region);
+    nextX = bPrev.region.x1 + 1;
+    const bNext = btn(rows.length, nextX, `[${t("receive.nextAddr")}]`, () => actions.selectReceiveAddress(index + 1));
+    rows.push(bNext.row);
+    regions.push(bNext.region);
+    nextX = bNext.region.x1 + 1;
+  }
+  const bRef = btn(rows.length, nextX, `[${t("ui.refresh")}]`, actions.refresh);
+  rows.push(bRef.row);
+  regions.push(bRef.region);
 
   const hints: Row[] = [
     { text: t("receive.hint1"), color: C.gray },

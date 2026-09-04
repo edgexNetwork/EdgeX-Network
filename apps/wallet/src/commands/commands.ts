@@ -73,6 +73,60 @@ export function builtinCommands(): Command[] {
       run: (_args, ctx) => ctx.core.getAddress(),
     },
     {
+      name: "newaddress",
+      aliases: ["getnewaddress", "new"],
+      summary: () => t("cmd.summary.newaddress"),
+      usage: "newaddress",
+      run: (_args, ctx) => ctx.core.getNewAddress(),
+    },
+    {
+      name: "listaddresses",
+      aliases: ["addresses", "getaddresses"],
+      summary: () => t("cmd.summary.listaddresses"),
+      usage: "listaddresses",
+      run: (_args, ctx) => ctx.core.walletAddresses().join("\n"),
+    },
+    {
+      name: "listunspent",
+      aliases: ["utxos"],
+      summary: () => t("cmd.summary.listunspent"),
+      usage: "listunspent [minconf] [maxconf]",
+      run: async (args, ctx) => {
+        const minconf = args[0] !== undefined && /^\d+$/.test(args[0]) ? Number(args[0]) : 0;
+        const maxconf = args[1] !== undefined && /^\d+$/.test(args[1]) ? Number(args[1]) : 9999999;
+        const utxos = await ctx.core.listUnspent(minconf, maxconf);
+        if (utxos.length === 0) return t("history.empty");
+        return utxos
+          .map((u) => `${truncateMiddle(u.txid, 16)}:${u.index}  ${trimEDX(u.amount)} ${COIN_TICKER} (${u.address})`)
+          .join("\n");
+      },
+    },
+    {
+      name: "getwalletinfo",
+      aliases: ["walletinfo"],
+      summary: () => t("cmd.summary.getwalletinfo"),
+      usage: "getwalletinfo",
+      run: async (_args, ctx) => {
+        const info = await ctx.core.getWalletInfo();
+        const count = ctx.core.walletAddresses().length;
+        return `${t("cmd.walletinfo.walletname", { name: info.walletname })}\n${t("cmd.walletinfo.addresses", { count })}\n${t("cmd.balance.available", { balance: trimEDX(info.balance), ticker: COIN_TICKER })}`;
+      },
+    },
+    {
+      name: "getbalances",
+      aliases: ["balances"],
+      summary: () => t("cmd.summary.getbalances"),
+      usage: "getbalances",
+      run: async (_args, ctx) => {
+        const balances = await ctx.core.getBalances();
+        return [
+          t("cmd.balances.trusted", { amount: trimEDX(balances.mine.trusted), ticker: COIN_TICKER }),
+          t("cmd.balances.pending", { amount: trimEDX(balances.mine.untrusted_pending), ticker: COIN_TICKER }),
+          t("cmd.balances.immature", { amount: trimEDX(balances.mine.immature), ticker: COIN_TICKER }),
+        ].join("\n");
+      },
+    },
+    {
       name: "send",
       aliases: ["sendtoaddress"],
       summary: () => t("cmd.summary.send"),

@@ -391,6 +391,54 @@ describe("钱包视图 own_*（本钱包地址走 own_txs/own_utxos，其他地�
     expect(store.addressTxids(ALICE, 20)).toHaveLength(0);
     store.close();
   });
+
+  test("multi-address wallet: every listed address is maintained in the own view and balances stay per-address", () => {
+    // Two derived wallet addresses (ALICE and BOB) are both treated as own;
+    // a third address stays on the full-index path.
+    const CAROL = addressFromPublicKey(generateKeyPair().publicKeyHex);
+    const store = new ChainStore(path.join(dir, "chain-multi.db"), [ALICE, BOB]);
+    try {
+      store.open();
+      const genesis = block(0, ZEROS64);
+      const { block: b1, txid: fundingAlice } = minedBlock(1, genesis.hash, ALICE, "50.00000000");
+      const { block: b2, txid: fundingBob } = minedBlock(2, b1.hash, BOB, "60.00000000");
+      const spend = spendTx(
+        fundingAlice,
+        0,
+        [
+          { address: CAROL, amount: "20.00000000" },
+          { address: ALICE, amount: "29.99000000" },
+        ],
+        "0.01",
+      );
+      const spendTxid = transactionId(spend);
+      store.appendBlocks([genesis, b1, b2, block(3, b2.hash, { transactions: [spend] })]);
+      // Both wallet addresses are maintained in own_utxos, and per-address reads
+      // never leak across addresses (regression guard for the address=? filter).
+      expect(store.addressBalance(ALICE)).toBe(2999000000n);
+      expect(store.addressBalance(BOB)).toBe(6000000000n);
+      expect(store.addressUtxos(ALICE, 3)).toHaveLength(1);
+      expect(store.addressUtxos(ALICE, 3)[0]!.txid).toBe(spendTxid);
+      // BOB's mining reward matures at height 8; at height 8 it is spendable.
+      expect(store.addressUtxos(BOB, 3)).toHaveLength(0);
+      expect(store.addressUtxos(BOB, 8)).toHaveLength(1);
+      expect(store.addressUtxos(BOB, 8)[0]!.txid).toBe(fundingBob);
+      // History: own_txs is the wallet-wide union, so any own address sees the
+      // whole wallet history; per-address isolation is enforced on balances/UTXOs.
+      const walletTxids = [fundingAlice, spendTxid, fundingBob].sort();
+      expect(store.addressTxids(ALICE, 20).map((t) => t.txid).sort()).toEqual(walletTxids);
+      expect(store.addressTxids(BOB, 20).map((t) => t.txid).sort()).toEqual(walletTxids);
+      // CAROL is not in the wallet view and is only reachable through the full index.
+      expect(store.addressBalance(CAROL)).toBe(2000000000n);
+      expect(store.isWalletAddress(ALICE)).toBe(true);
+      expect(store.isWalletAddress(BOB)).toBe(true);
+      expect(store.isWalletAddress(CAROL)).toBe(false);
+      // ALICE's remaining output is transfer change (mature); nothing is immature.
+      expect(store.addressImmature(ALICE, 3)).toBe(0n);
+    } finally {
+      store.close();
+    }
+  });
 });
 
 describe("分段归档与跨段读取", () => {

@@ -300,9 +300,18 @@ export class ChainStore {
 
   constructor(
     private readonly filePath: string,
-    private readonly walletAddress = "",
+    walletAddresses: string | readonly string[] = "",
     private readonly maxSegmentBytes = DEFAULT_MAX_SEGMENT_BYTES,
-  ) {}
+  ) {
+    // The wallet-view set: every derived wallet address (external receive and
+    // internal change) is treated as own. A bare string keeps single-address
+    // call sites working.
+    const list = Array.isArray(walletAddresses) ? walletAddresses : walletAddresses ? [walletAddresses] : [];
+    this.walletAddresses = [...new Set(list.filter((address) => address !== ""))];
+  }
+
+  /** The wallet's own addresses (own_* resident views are maintained for exactly this set). */
+  readonly walletAddresses: string[];
 
   chainDbFilePath(): string {
     return this.filePath;
@@ -363,9 +372,27 @@ export class ChainStore {
     return this.db;
   }
 
-  /** Whether the address is this wallet's own (own_* views apply only to the wallet address; other addresses go through the full index). */
-  private isOwnAddress(address: string): boolean {
-    return this.walletAddress !== "" && address === this.walletAddress;
+  /** Whether the address belongs to this wallet (own_* views apply only to wallet addresses; others use the full index). */
+  isOwnAddress(address: string): boolean {
+    return this.walletAddresses.includes(address);
+  }
+
+  /** Whether the address belongs to this wallet (public RPC/ownership check). */
+  isWalletAddress(address: string): boolean {
+    return this.walletAddresses.includes(address);
+  }
+
+  /**
+   * Resolve the address that owns a spent or unspent output, looking through the
+   * full output index. Used to attribute a raw transaction's inputs to one of the
+   * wallet's derived addresses before signing.
+   */
+  outputAddressOf(txid: string, index: number): string | null {
+    if (!this.db) return null;
+    const row = this.db
+      .query("SELECT address FROM tx_outputs WHERE txid = ? AND idx = ?")
+      .get(txid, index) as { address: string } | null;
+    return row?.address ?? null;
   }
 
   private ensureSchema(): void {
@@ -621,11 +648,12 @@ export class ChainStore {
       // Un-finalized prepared statements hold file locks on Windows; release it as soon as we are done
       addrInsert.finalize();
     }
-    // Wallet view (own_*): this wallet address's transactions and unspent outputs stay resident, so hot queries don't cross segments after archival
-    if (this.walletAddress === "") return;
+    // Wallet view (own_*): transactions touching any wallet address and their
+    // unspent outputs stay resident, so hot queries don't cross segments after archival
+    if (this.walletAddresses.length === 0) return;
     const ownAffected =
-      tx.inputs.some((i) => i.address === this.walletAddress) ||
-      tx.outputs.some((o) => o.address === this.walletAddress);
+      tx.inputs.some((i) => this.walletAddresses.includes(i.address)) ||
+      tx.outputs.some((o) => this.walletAddresses.includes(o.address));
     if (!ownAffected) return;
     db.run(
       "INSERT INTO own_txs (txid, height, block_height, type, fee, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) " +
@@ -635,7 +663,7 @@ export class ChainStore {
     );
     // Spending this wallet's own output → mark spent
     for (const [inIdx, input] of tx.inputs.entries()) {
-      if (input.address !== this.walletAddress) continue;
+      if (!this.walletAddresses.includes(input.address)) continue;
       db.run(
         "UPDATE own_utxos SET spent_txid = ?, spent_idx = ? WHERE txid = ? AND idx = ? AND spent_txid IS NULL",
         [tx.txid, inIdx, input.txid, input.index],
@@ -644,7 +672,7 @@ export class ChainStore {
     // This wallet's own outputs → insert into own_utxos (maturity rule identical to the full index: only block mining rewards need maturity)
     const ownMatureAt = tx.type === "mining" && tx.blockHeight !== null ? tx.blockHeight + COINBASE_MATURITY : null;
     for (const [outIndex, output] of tx.outputs.entries()) {
-      if (output.address !== this.walletAddress) continue;
+      if (!this.walletAddresses.includes(output.address)) continue;
       db.run(
         "INSERT INTO own_utxos (txid, idx, address, amount, is_change, height, spent_txid, spent_idx, confirmed, mature_at_height, created_at) " +
           "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?) " +
@@ -952,8 +980,8 @@ export class ChainStore {
     const db = this.requireDb();
     if (this.isOwnAddress(address)) {
       const rows = db
-        .query("SELECT amount FROM own_utxos WHERE confirmed = 1 AND spent_txid IS NULL")
-        .all() as Array<{ amount: string }>;
+        .query("SELECT amount FROM own_utxos WHERE confirmed = 1 AND spent_txid IS NULL AND address = ?")
+        .all(address) as Array<{ amount: string }>;
       return rows.reduce((sum, r) => sum + BigInt(r.amount), 0n);
     }
     // Non-wallet address: merged across segments (candidate outputs − spent references; tx_inputs × address_txs merging keeps cross-segment freshness)
@@ -977,10 +1005,10 @@ export class ChainStore {
     if (this.isOwnAddress(address)) {
       const rows = db
         .query(
-          "SELECT amount FROM own_utxos WHERE confirmed = 1 AND spent_txid IS NULL " +
+          "SELECT amount FROM own_utxos WHERE confirmed = 1 AND spent_txid IS NULL AND address = ? " +
             "AND mature_at_height IS NOT NULL AND mature_at_height > ?",
         )
-        .all(currentHeight) as Array<{ amount: string }>;
+        .all(address, currentHeight) as Array<{ amount: string }>;
       return rows.reduce((sum, r) => sum + BigInt(r.amount), 0n);
     }
     // Non-wallet address: merged across segments (candidate outputs − spent references; tx_inputs + address_txs merging keeps cross-segment freshness)
@@ -1009,10 +1037,10 @@ export class ChainStore {
     if (this.isOwnAddress(address)) {
       const rows = db
         .query(
-          `${SELECT_OWN_OUTPUT} WHERE confirmed = 1 AND spent_txid IS NULL ` +
+          `${SELECT_OWN_OUTPUT} WHERE address = ? AND confirmed = 1 AND spent_txid IS NULL ` +
             "AND (mature_at_height IS NULL OR mature_at_height <= ?) ORDER BY created_at ASC, idx ASC",
         )
-        .all(currentHeight) as LocalOutputRow[];
+        .all(address, currentHeight) as LocalOutputRow[];
       return rows.map((r) => ({ ...r, amount: edxAmount(r.amount) }));
     }
     // Non-wallet address: merged across segments
@@ -1085,7 +1113,7 @@ export class ChainStore {
           amount: utxo ? edxAmount(utxo.amount) : "0",
         };
       });
-      const changeIndex = payload.outputs.findIndex((o) => o.address === this.walletAddress);
+      const changeIndex = payload.outputs.findIndex((o) => this.walletAddresses.includes(o.address));
       return {
         txid,
         type: "transfer",

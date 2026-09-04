@@ -106,6 +106,8 @@ describe("legacy TUI structure", () => {
     cols: 100,
     mainH: 20,
     address: "EDXADDRESS",
+    receiveAddresses: ["EDXADDRESS"],
+    receiveIndex: 0,
     selfP2pUrl: "",
     requirePassword: true,
     peersText: "",
@@ -124,6 +126,8 @@ describe("legacy TUI structure", () => {
     addRow: () => {},
     delRow: () => {},
     showTx: () => {},
+    selectReceiveAddress: () => {},
+    newReceiveAddress: () => {},
     reconnect: () => {},
     scrollBy: () => {},
   };

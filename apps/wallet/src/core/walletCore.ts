@@ -29,7 +29,16 @@ import path from "node:path";
 import { existsSync, rmSync } from "node:fs";
 import { CHAIN_DB_FILE_NAME } from "../config/config";
 import { ChainDataError, ChainStore, isLegacyEncryptedChainDb } from "./walletDatabase";
-import { normalizePayments, planSplitTransfer } from "./transactionPlanner";
+import { normalizePayments, orderUtxosByAddress, planAddressChunks } from "./transactionPlanner";
+import {
+  deriveChangeAddress,
+  deriveExternalAddress,
+  findAddressIndex,
+  listWalletAddresses,
+  nextChangeAddress,
+  nextExternalAddress,
+  type DerivedAddressKey,
+} from "../keys/addressIndex";
 
 const POLL_INTERVAL_MS = 15_000;
 export interface PaymentInput {
@@ -78,7 +87,13 @@ export class WalletCore {
         this.log.warn(`Legacy chain database removal failed: ${(error as Error).message}`);
       }
     }
-    this.database = new ChainStore(chainDbPath, key.address, config.maxSegmentBytes);
+    // Every derived wallet address (external receive + internal change) forms
+    // the own-view of the local chain database.
+    this.database = new ChainStore(
+      chainDbPath,
+      listWalletAddresses(config.datadir, key.mnemonic),
+      config.maxSegmentBytes,
+    );
     this.conn = new ConnectionManager({
       nodeUrl: baseUrl,
       configuredNodes: config.addnodes,
@@ -186,9 +201,34 @@ export class WalletCore {
   }
 
   async refreshBalance(): Promise<bigint | null> {
-    const utxos = await this.conn
-      .request<{ items: UtxoDTO[] }>("GET", `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`)
-      .then((result) => result.items);
+    const { available, immature } = await this.fetchWalletBalance();
+    this.balanceValue = available;
+    this.bus.emit("balance:update", formatEdxAmount(available));
+    return available;
+  }
+
+  /** Fetch UTXOs of every wallet address from the node and merge them (deduped). */
+  private async fetchWalletUtxos(): Promise<UtxoDTO[]> {
+    const addresses = this.walletAddresses();
+    const all: UtxoDTO[] = [];
+    const seen = new Set<string>();
+    for (const address of addresses) {
+      const items = await this.conn
+        .request<{ items: UtxoDTO[] }>("GET", `/wallet/utxos?address=${encodeURIComponent(address)}`)
+        .then((result) => result.items);
+      for (const utxo of items) {
+        const key = `${utxo.txid}:${utxo.index}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        all.push(utxo);
+      }
+    }
+    return all;
+  }
+
+  /** Total available and immature balance across every wallet address. */
+  private async fetchWalletBalance(): Promise<{ available: bigint; immature: bigint }> {
+    const utxos = await this.fetchWalletUtxos();
     let available = 0n;
     let immature = 0n;
     const maturity = 6;
@@ -197,9 +237,7 @@ export class WalletCore {
       if (utxo.spendable) available += amount;
       else if (utxo.isCoinbase && this.chain.height < utxo.birthHeight + maturity) immature += amount;
     }
-    this.balanceValue = available;
-    this.bus.emit("balance:update", formatEdxAmount(available));
-    return available;
+    return { available, immature };
   }
 
   async getAvailableBalance(): Promise<bigint | null> {
@@ -209,9 +247,7 @@ export class WalletCore {
 
   async getBalanceDetail(): Promise<{ chain: string; reserved: string; available: string; immature: string } | null> {
     try {
-      const utxos = await this.conn
-        .request<{ items: UtxoDTO[] }>("GET", `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`)
-        .then((result) => result.items);
+      const utxos = await this.fetchWalletUtxos();
       let available = 0n;
       let total = 0n;
       let immature = 0n;
@@ -254,7 +290,15 @@ export class WalletCore {
 
   async send(payments: PaymentInput[], options: SendOptions = {}, password?: string): Promise<string> {
     if (!this.chain.isSynced()) throw walletError(RPC_CODE.GENERIC, "Local chain is not synced yet");
-    const normalizedPayments = normalizePayments(payments, this.key.address);
+    const ownAddresses = this.walletAddresses();
+    // Sending to any address of this wallet is a self-payment and is rejected.
+    const fromSet = new Set(ownAddresses);
+    const normalizedPayments = normalizePayments(payments, ownAddresses[0]!).map((payment) => {
+      if (fromSet.has(payment.address)) {
+        throw walletError(RPC_CODE.INVALID_PARAMS, "Cannot send to yourself");
+      }
+      return payment;
+    });
     if (this.requirePassword()) {
       if (!password) throw walletError(RPC_CODE.GENERIC, "Wallet locked: password required");
       const unlocked = loadWalletKey(this.config.datadir, password);
@@ -262,11 +306,10 @@ export class WalletCore {
     }
 
     const fee = resolveFee(await this.getFees(), { explicitFee: options.explicitFee, tier: options.tier });
-    const utxos = (await this.conn
-      .request<{ items: UtxoDTO[] }>("GET", `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`)
-      .then((result) => result.items)).filter((utxo) => utxo.spendable);
+    const utxos = (await this.fetchWalletUtxos()).filter((utxo) => utxo.spendable);
+    const groups = orderUtxosByAddress(utxos);
+    const chunks = planAddressChunks(groups, normalizedPayments, fee.fee);
 
-    const chunks = planSplitTransfer(utxos, normalizedPayments, fee.fee);
     let firstTxid: string | null = null;
     for (const chunk of chunks) {
       const outputs = chunk.outputs.map((output) => ({
@@ -274,15 +317,18 @@ export class WalletCore {
         amount: formatEdxAmount(output.amountPhotons),
       }));
       if (chunk.change > 0n) {
-        outputs.push({ address: this.key.address, amount: formatEdxAmount(chunk.change) });
+        outputs.push({ address: chunk.from, amount: formatEdxAmount(chunk.change) });
       }
+      // Each transaction is signed by the address that funded it (a transaction
+      // carries one public key, so all inputs share one owner).
+      const signerKey = this.addressKey(chunk.from);
       const signed: SignedTransaction = signTransaction(
         {
           inputs: chunk.utxos.map((utxo) => ({ txid: utxo.txid, index: utxo.index })),
           outputs,
           fee: formatEdxAmount(fee.fee),
         },
-        Buffer.from(this.key.privateKey).toString("hex"),
+        Buffer.from(signerKey.privateKey).toString("hex"),
       );
       const txid = await this.conn
         .request<{ txid: string }>("POST", "/transactions", signed)
@@ -319,52 +365,76 @@ export class WalletCore {
     }
 
     const fee = resolveFee(await this.getFees(), {});
-    const normalizedPayments = normalizePayments(payments, this.key.address);
-    const utxos = (await this.conn
-      .request<{ items: UtxoDTO[] }>("GET", `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`)
-      .then((result) => result.items)).filter((utxo) => utxo.spendable);
+    const ownAddresses = this.walletAddresses();
+    const fromSet = new Set(ownAddresses);
+    const normalizedPayments = normalizePayments(payments, ownAddresses[0]!).map((payment) => {
+      if (fromSet.has(payment.address)) {
+        throw walletError(RPC_CODE.INVALID_PARAMS, "Cannot send to yourself");
+      }
+      return payment;
+    });
+    const utxos = (await this.fetchWalletUtxos()).filter((utxo) => utxo.spendable);
 
-    // The tip amount is tiny, so a single transfer covers it (planSplitTransfer guarantees at least one chunk when payments is non-empty)
-    const chunk = planSplitTransfer(utxos, normalizedPayments, fee.fee)[0]!;
+    // The tip amount is tiny, so a single chunk covers it; it is funded by the
+    // first (largest) address group and keeps the change at that address.
+    const groups = orderUtxosByAddress(utxos);
+    const chunk = planAddressChunks(groups, normalizedPayments, fee.fee)[0]!;
     const outputs = chunk.outputs.map((output) => ({
       address: output.address,
       amount: formatEdxAmount(output.amountPhotons),
     }));
     if (chunk.change > 0n) {
-      outputs.push({ address: this.key.address, amount: formatEdxAmount(chunk.change) });
+      outputs.push({ address: chunk.from, amount: formatEdxAmount(chunk.change) });
     }
+    const signerKey = this.addressKey(chunk.from);
     return signTransaction(
       {
         inputs: chunk.utxos.map((utxo) => ({ txid: utxo.txid, index: utxo.index })),
         outputs,
         fee: formatEdxAmount(fee.fee),
       },
-      Buffer.from(this.key.privateKey).toString("hex"),
+      Buffer.from(signerKey.privateKey).toString("hex"),
     );
   }
 
+  /** History across every wallet address, merged and sorted newest-first. */
   async listTransactions(limit = 20): Promise<TxView[]> {
-    return this.conn.request<TxView[]>("GET", `/wallet/history?address=${encodeURIComponent(this.key.address)}&limit=${limit}`);
+    const addresses = this.walletAddresses();
+    const all: TxView[] = [];
+    const seen = new Set<string>();
+    for (const address of addresses) {
+      const page = await this.conn.request<TxView[]>(
+        "GET",
+        `/wallet/history?address=${encodeURIComponent(address)}&limit=${limit * 2}`,
+      );
+      for (const tx of page) {
+        if (seen.has(tx.txid)) continue;
+        seen.add(tx.txid);
+        all.push(tx);
+      }
+    }
+    all.sort((left, right) => right.time - left.time);
+    return all.slice(0, limit);
   }
 
   async refreshTransactions(limit = 20): Promise<TxView[]> {
-    this.transactions = await this.conn.request<TxView[]>("GET", `/wallet/history?address=${encodeURIComponent(this.key.address)}&limit=${limit}`);
+    this.transactions = await this.listTransactions(limit);
     this.bus.emit("tx:update", this.transactions);
     return this.transactions;
   }
 
-  /** gettransaction: a transaction that involves this wallet (send or receive). */
+  /** gettransaction: a transaction that involves this wallet (any derived address). */
   async getTransaction(txid: string): Promise<TxView | null> {
     const view = await this.conn.request<TxView | null>("GET", `/transactions/${encodeURIComponent(txid)}`);
     if (!view) return null;
-    // Wallet-scoped semantics: only transactions that touch the wallet address
-    // are returned; anything else on the chain is invisible here (full-chain
-    // lookups belong to getrawtransaction).
-    const own = this.key.address;
+    // Wallet-scoped semantics: only transactions that touch one of the wallet's
+    // addresses are returned; anything else on the chain is invisible here
+    // (full-chain lookups belong to getrawtransaction).
+    const own = new Set(this.walletAddresses());
     const involvesWallet =
-      view.from === own ||
-      view.inputs.some((input) => input.address === own) ||
-      view.outputs.some((output) => output.address === own);
+      (view.from !== null && own.has(view.from)) ||
+      view.inputs.some((input) => own.has(input.address)) ||
+      view.outputs.some((output) => own.has(output.address));
     return involvesWallet ? view : null;
   }
 
@@ -378,19 +448,37 @@ export class WalletCore {
 
   // ---- RPC support surface (bitcoind-style methods backed by the node REST API and the local chain store) ----
 
-  /** All addresses this wallet can sign for. The decentralized wallet is single-address: the main key address. */
+  /** Every derived wallet address (external receive + internal change); the main address is always first. */
   walletAddresses(): string[] {
-    return [this.key.address];
+    return listWalletAddresses(this.config.datadir, this.key.mnemonic);
   }
 
-  /** getnewaddress: the wallet's single receive address (label is accepted for bitcoind compatibility). */
+  /** Resolve the key material for one of the wallet's derived addresses (falls back to the main key). */
+  private addressKey(address: string): WalletKey {
+    const found = findAddressIndex(this.config.datadir, this.key.mnemonic, address);
+    const derived: DerivedAddressKey =
+      found === null
+        ? deriveExternalAddress(this.key.mnemonic, 0)
+        : found.change === 0
+          ? deriveExternalAddress(this.key.mnemonic, found.index)
+          : deriveChangeAddress(this.key.mnemonic, found.index);
+    return {
+      mnemonic: this.key.mnemonic,
+      derivationPath: this.key.derivationPath,
+      privateKey: derived.privateKey,
+      publicKey: derived.publicKey,
+      address: derived.address,
+    };
+  }
+
+  /** getnewaddress: derive and persist the next external (receive) address. */
   getNewAddress(_label?: string): string {
-    return this.key.address;
+    return nextExternalAddress(this.config.datadir, this.key.mnemonic).address;
   }
 
-  /** getrawchangeaddress: the wallet's single address is used for change too. */
+  /** getrawchangeaddress: derive and persist the next internal (change) address. */
   getRawChangeAddress(): string {
-    return this.key.address;
+    return nextChangeAddress(this.config.datadir, this.key.mnemonic).address;
   }
 
   /** walletpassphrase: verify the vault password; a successful call opens the unlocked window. */
@@ -405,18 +493,28 @@ export class WalletCore {
 
   /** walletlock: forget the unlocked window (password is always required per call in this wallet). */
   lock(): void {
-    // The decentralized wallet never keeps the password in memory between calls.
+    // The wallet never keeps the password in memory between calls.
   }
 
-  /** Sign a raw (hex-encoded UTF-8 JSON) transaction body with the wallet key. */
+  /** Sign a raw (hex-encoded UTF-8 JSON) transaction body with the wallet key that owns its inputs. */
   signRawTransaction(hex: string): { hex: string; complete: boolean } {
     const tx = decodeRawTransactionBody(hex);
     if (tx.pubkey && tx.signature) {
       return { hex, complete: true };
     }
+    // Attribute the inputs to a derived wallet address through the local output
+    // index; when that is unavailable, the main address signs.
+    let signer = this.addressKey(this.key.address);
+    if (tx.inputs.length > 0) {
+      const input = tx.inputs[0]!;
+      const owner = this.database.isOpen ? this.database.outputAddressOf(input.txid, input.index) : null;
+      if (owner && this.walletAddresses().includes(owner)) {
+        signer = this.addressKey(owner);
+      }
+    }
     const signed = signTransaction(
       { inputs: tx.inputs, outputs: tx.outputs, fee: tx.fee },
-      Buffer.from(this.key.privateKey).toString("hex"),
+      Buffer.from(signer.privateKey).toString("hex"),
     );
     return { hex: encodeRawTransactionHex(signed), complete: true };
   }
@@ -428,7 +526,8 @@ export class WalletCore {
       throw walletError(RPC_CODE.INVALID_PARAMS, "fundrawtransaction requires a raw tx with at least one input");
     }
     // The caller supplied the inputs; the node validates the exact fee.
-    return { hex, fee: tx.fee, changepos: tx.outputs.findIndex((o) => o.address === this.key.address) };
+    const own = new Set(this.walletAddresses());
+    return { hex, fee: tx.fee, changepos: tx.outputs.findIndex((o) => own.has(o.address)) };
   }
 
   /** decoderawtransaction: parse a hex(UTF-8 JSON) raw transaction body. */
@@ -488,17 +587,14 @@ export class WalletCore {
     return encodeRawTransactionHex(body);
   }
 
-  /** gettxout: unspent output detail for (txid, n). */
+  /** gettxout: unspent output detail for (txid, n) across all wallet addresses. */
   async getTxOut(txid: string, n: number): Promise<{
     bestblock: string;
     confirmations: number;
     value: string;
     scriptPubKey: { asm: string; type: string };
   } | null> {
-    const utxos = await this.conn.request<{ items: UtxoDTO[] }>(
-      "GET",
-      `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`,
-    ).then((r) => r.items);
+    const utxos = await this.fetchWalletUtxos();
     const hit = utxos.find((u) => u.txid === txid && u.index === n);
     if (!hit) return null;
     return {
@@ -663,7 +759,7 @@ export class WalletCore {
     };
   }
 
-  /** listunspent: confirmed unspent outputs (optionally filtered by address). */
+  /** listunspent: confirmed unspent outputs across every wallet address (optionally filtered by address). */
   async listUnspent(minconf = 0, maxconf = 9999999, addresses?: string[]): Promise<Array<{
     txid: string;
     index: number;
@@ -671,13 +767,18 @@ export class WalletCore {
     amount: string;
     confirmations: number;
   }>> {
-    const utxos = await this.conn.request<{ items: UtxoDTO[] }>(
-      "GET",
-      `/wallet/utxos?address=${encodeURIComponent(this.key.address)}`,
-    ).then((r) => r.items);
-    const addressSet = addresses && addresses.length > 0 ? new Set(addresses) : null;
-    return utxos
-      .filter((u) => (addressSet ? addressSet.has(u.address) : true))
+    const utxos = await this.fetchWalletUtxos();
+    // Caller-supplied addresses narrow the wallet set; addresses that are not
+    // in this wallet are ignored (bitcoind listunspent semantics).
+    const ownSet = new Set(this.walletAddresses());
+    const requested =
+      addresses && addresses.length > 0
+        ? [...new Set(addresses.filter((address) => ownSet.has(address)))]
+        : null;
+    const rows = requested
+      ? utxos.filter((u) => requested.includes(u.address))
+      : utxos;
+    return rows
       .filter((u) => {
         const confirmations = this.chain.height - u.birthHeight + 1;
         return confirmations >= minconf && confirmations <= maxconf;
@@ -716,30 +817,32 @@ export class WalletCore {
     };
   }
 
-  /** getwalletinfo: wallet identity. */
-  getWalletInfo(): { walletname: string; balance: string; keypoolsize: number; unlocked_until: number } {
+  /** getwalletinfo: wallet identity and derived-address count. */
+  getWalletInfo(): { walletname: string; balance: string; keypoolsize: number; unlocked_until: number; addressCount: number } {
     return {
       walletname: this.key.address,
       balance: formatEdxAmount(this.balanceValue ?? 0n),
-      keypoolsize: 1,
+      keypoolsize: this.walletAddresses().length,
       unlocked_until: 0,
+      addressCount: this.walletAddresses().length,
     };
   }
 
-  /** validateaddress: whether the string is a valid EDX address. */
+  /** validateaddress: whether the string is a valid EDX address and belongs to this wallet. */
   validateAddress(address: string): { isvalid: boolean; address: string; ismine: boolean; iswatchonly: boolean; isscript: boolean; ischange: boolean } {
     const isvalid = validateAddress(address);
+    const found = isvalid ? findAddressIndex(this.config.datadir, this.key.mnemonic, address) : null;
     return {
       isvalid,
       address,
-      ismine: isvalid && address === this.key.address,
+      ismine: found !== null,
       iswatchonly: false,
       isscript: false,
-      ischange: false,
+      ischange: found !== null && found.change === 1,
     };
   }
 
-  /** getaddressinfo: address metadata. */
+  /** getaddressinfo: address metadata (ownership, branch, index and public key). */
   getAddressInfo(address: string): {
     address: string;
     ismine: boolean;
@@ -751,15 +854,24 @@ export class WalletCore {
     index: number;
   } {
     const isvalid = validateAddress(address);
+    const found = isvalid ? findAddressIndex(this.config.datadir, this.key.mnemonic, address) : null;
+    let pubkey = "";
+    if (found !== null) {
+      const derived =
+        found.change === 0
+          ? deriveExternalAddress(this.key.mnemonic, found.index)
+          : deriveChangeAddress(this.key.mnemonic, found.index);
+      pubkey = bytesToHex(derived.publicKey);
+    }
     return {
       address,
-      ismine: isvalid && address === this.key.address,
+      ismine: found !== null,
       iswatchonly: false,
       isscript: false,
-      ischange: false,
+      ischange: found !== null && found.change === 1,
       scriptPubKey: "",
-      pubkey: isvalid && address === this.key.address ? bytesToHex(this.key.publicKey) : "",
-      index: 0,
+      pubkey,
+      index: found !== null ? found.index : 0,
     };
   }
 
@@ -768,28 +880,33 @@ export class WalletCore {
     return validateAddress(address);
   }
 
-  /** dumpprivkey: export the private key hex for the wallet address (password required). */
+  /** dumpprivkey: export the private key hex of a derived wallet address (password required). */
   dumpPrivKey(address: string, password: string): string {
-    if (address !== this.key.address) throw walletError(RPC_CODE.INVALID_ADDRESS_OR_KEY, "Address is not in this wallet");
+    if (!this.walletAddresses().includes(address)) {
+      throw walletError(RPC_CODE.INVALID_ADDRESS_OR_KEY, "Address is not in this wallet");
+    }
     if (this.requirePassword() && !this.unlock(password)) {
       throw walletError(RPC_CODE.GENERIC, "Wrong wallet password; cannot export private key");
     }
-    return Buffer.from(this.key.privateKey).toString("hex");
+    return Buffer.from(this.addressKey(address).privateKey).toString("hex");
   }
 
-  /** signmessage: sign an arbitrary message with the wallet key (password required). */
+  /** signmessage: sign an arbitrary message with the key of a derived wallet address (password required). */
   signMessageForAddress(address: string, message: string, password: string): string {
-    if (address !== this.key.address) throw walletError(RPC_CODE.INVALID_ADDRESS_OR_KEY, "Address is not in this wallet");
+    if (!this.walletAddresses().includes(address)) {
+      throw walletError(RPC_CODE.INVALID_ADDRESS_OR_KEY, "Address is not in this wallet");
+    }
     if (this.requirePassword() && !this.unlock(password)) {
       throw walletError(RPC_CODE.GENERIC, "Wrong wallet password; cannot sign message");
     }
-    return signMessage(Buffer.from(this.key.privateKey).toString("hex"), message);
+    return signMessage(Buffer.from(this.addressKey(address).privateKey).toString("hex"), message);
   }
 
-  /** verifymessage: verify a message signature against the wallet's public key. */
+  /** verifymessage: verify a message signature against the public key of a derived wallet address. */
   verifyMessageForAddress(address: string, message: string, signature: string): boolean {
-    if (address !== this.key.address) return false;
-    return verifySignature(bytesToHex(this.key.publicKey), message, signature);
+    if (!this.walletAddresses().includes(address)) return false;
+    const key = this.addressKey(address);
+    return verifySignature(bytesToHex(key.publicKey), message, signature);
   }
 
   /** getblockhash: block hash at the given height (local database; falls back to the live tip). */
