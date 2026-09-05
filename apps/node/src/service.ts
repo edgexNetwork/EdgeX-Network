@@ -74,8 +74,9 @@ export class ChainService {
     verifier: PowVerifier,
     private readonly store: BlockchainStore,
     private readonly networkId: string,
+    nowMs: () => number = () => Date.now(),
   ) {
-    this.chain = new ConsensusChain(verifier);
+    this.chain = new ConsensusChain(verifier, nowMs);
     if (this.store.count() === 0) {
       const genesis = createGenesisBlock();
       this.store.saveBlock(genesis, workForDifficulty(genesis.header.difficulty));

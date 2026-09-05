@@ -74,6 +74,25 @@ export class ConsensusChain {
     return this.get(hashHex).state.clone();
   }
 
+  /** Blocks on the current best chain, ordered from genesis to the tip. */
+  bestChainBlocks(): Block[] {
+    return this.ancestry(this.bestHash);
+  }
+
+  /** Block at the given height on the current best chain, or null when that height is not stored. */
+  chainAtHeight(height: number): Block | null {
+    if (!Number.isSafeInteger(height) || height < 0) return null;
+    const path = this.ancestry(this.bestHash);
+    return path[height] ?? null;
+  }
+
+  /** Cumulative chain work up to the block at the given best-chain height, or null when out of range. */
+  cumulativeWorkAt(height: number): bigint | null {
+    const block = this.chainAtHeight(height);
+    if (!block) return null;
+    return this.get(block.hash).totalWork;
+  }
+
   nextConsensusData(): NextConsensusData {
     const parent = this.get(this.bestHash).block;
     const nextHeight = parent.header.height + 1;
@@ -164,6 +183,22 @@ export class ConsensusChain {
       hash = entry.block.header.previousHash;
     }
     return result.reverse();
+  }
+
+  /**
+   * Canonical path of the block with the given hash, ordered from genesis to
+   * that block. Returns null when the hash is unknown.
+   */
+  pathFrom(startHash: string): Block[] | null {
+    if (!this.entries.has(startHash)) return null;
+    return this.ancestry(startHash);
+  }
+
+  /** Cumulative chain work up to the block with the given hash, or null when unknown. */
+  cumulativeWorkFrom(startHash: string): bigint | null {
+    const entry = this.entries.get(startHash);
+    if (!entry) return null;
+    return entry.totalWork;
   }
 
   private ancestor(startHash: string, height: number): Block {

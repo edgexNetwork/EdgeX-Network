@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 import { mkdirSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
 import { GENESIS_HASH, Sha256PowVerifier } from '@edgex/core';
 import { BlockchainStore } from './storage';
 import { ChainService } from './service';
@@ -8,7 +7,7 @@ import { P2PNetwork } from './p2p';
 import { RpcServer } from './rpc';
 import { StratumServer } from './stratum';
 import { NativeRandomXVerifier } from './randomx';
-import { loadNodeConfig } from './config';
+import { loadNodeConfig, loadOrCreateNodeId } from './config';
 
 async function main(): Promise<void> {
   const config = loadNodeConfig();
@@ -19,7 +18,7 @@ async function main(): Promise<void> {
   const store = new BlockchainStore(`${config.dataDir}/chain.sqlite`);
   const verifier = config.nativeRandomX ? new NativeRandomXVerifier(config.randomXLibrary) : new Sha256PowVerifier();
   const service = new ChainService(verifier, store, config.networkId);
-  const nodeId = randomUUID();
+  const nodeId = loadOrCreateNodeId(config.dataDir, config.nodeId);
   const rpc = new RpcServer({
     host: config.rpcHost,
     port: config.rpcPort,
@@ -42,11 +41,30 @@ async function main(): Promise<void> {
     },
     config.publicUrl,
   );
+  network.setPeerDataSource({
+    status: () => {
+      const hash = service.chain.bestBlockHash;
+      const totalWork = service.chain.cumulativeWorkFrom(hash) ?? 0n;
+      return { height: service.chain.height, bestHash: hash, totalWork: totalWork.toString() };
+    },
+    chainAtHeight: (height) => service.chain.chainAtHeight(height),
+    cumulativeWorkFrom: (hash) => service.chain.cumulativeWorkFrom(hash),
+    has: (hash) => service.chain.has(hash),
+    peerStatus: () => {
+      const peers = network.knownPeerUrls();
+      return {
+        connected: network.peerCount,
+        total: peers.length,
+        items: peers.map((address) => ({ address, connected: true, source: 'p2p' })),
+      };
+    },
+  });
   service.onTransactionAccepted = (transaction) => {
     network.broadcast({ type: 'transaction', transaction });
   };
   service.onBlockAccepted = (block) => {
     network.broadcast({ type: 'block', block });
+    network.notifyChainAdvanced();
     stratum.notifyNewTip();
   };
   network.setRpcHandler(async (method, path, body) => {

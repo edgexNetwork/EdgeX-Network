@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { PeerView } from "../api/types";
 import type { Logger } from "../utils/log";
-import { PeerLink, type PeerRpcResult } from "./peerLink";
+import { PeerLink } from "./peerLink";
 
 export interface ConnectionManagerOptions {
   nodeUrl: string;
@@ -224,9 +224,12 @@ export class ConnectionManager {
     }
     for (const link of state.links) {
       try {
-        const result: PeerRpcResult = await link.request(method, path, body);
+        // The peer link unwraps successful responses to their payload (a
+        // non-2xx status rejects instead of returning an envelope), so the
+        // payload is repacked into the transport result shape here.
+        const payload = await link.request<unknown>(method, path, body);
         state.view.connected = true;
-        return result;
+        return { status: 200, data: payload };
       } catch (error) {
         state.view.connected = false;
         lastErrorStore.set(this, error);
