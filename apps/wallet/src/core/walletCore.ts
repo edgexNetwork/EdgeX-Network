@@ -397,15 +397,19 @@ export class WalletCore {
     );
   }
 
-  /** History across every wallet address, merged and sorted newest-first. */
-  async listTransactions(limit = 20): Promise<TxView[]> {
+  /**
+   * History across every wallet address, merged and sorted newest-first.
+   * The node pages are over-fetched (per address) so the merged result can
+   * honor the skip offset without missing entries that fall between pages.
+   */
+  async listTransactions(limit = 20, skip = 0): Promise<TxView[]> {
     const addresses = this.walletAddresses();
     const all: TxView[] = [];
     const seen = new Set<string>();
     for (const address of addresses) {
       const page = await this.conn.request<TxView[]>(
         "GET",
-        `/wallet/history?address=${encodeURIComponent(address)}&limit=${limit * 2}`,
+        `/wallet/history?address=${encodeURIComponent(address)}&limit=${Math.max(limit, 1) * 2 + skip * 2}`,
       );
       for (const tx of page) {
         if (seen.has(tx.txid)) continue;
@@ -414,7 +418,7 @@ export class WalletCore {
       }
     }
     all.sort((left, right) => right.time - left.time);
-    return all.slice(0, limit);
+    return all.slice(skip, skip + limit);
   }
 
   async refreshTransactions(limit = 20): Promise<TxView[]> {

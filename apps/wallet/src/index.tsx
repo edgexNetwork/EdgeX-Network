@@ -30,6 +30,7 @@ import { Onboarding } from "./tui/Onboarding";
 import { warnAndPromptTuiEnv } from "./tui/envCheck";
 import { applyStoredLang, currentLocale, t } from "./i18n";
 import { startWalletRpc } from "./rpc/lifecycle";
+import { runConsoleWithReadline } from "./cli/consoleSession";
 
 const VERSION = "1.0.0";
 
@@ -39,6 +40,7 @@ function printHelp(): void {
 Usage:
   edgex-wallet                       Start the full TUI (onboarding, top bar, dual modes)
   edgex-wallet daemon                Start without UI (node polling remains active)
+  edgex-wallet console               Start the interactive line console (edx> )
   edgex-wallet init                  Create a wallet interactively
   edgex-wallet init --restore        Import a wallet interactively
   edgex-wallet <command> [args...]   Run one command (balance, send, history, ...)
@@ -49,9 +51,10 @@ Global options:
   --help / --version
 
 Commands:
-  help | info | balance | receive | history [count] | tx <txid>
+  help | info | balance | receive | history [count] [skip] | tx <txid>
+  listaddresses [count] [skip] | listunspent [minconf] [maxconf] [count] [skip]
   send <address>:<amount> [...] [fee] [slow|normal|fast] [password]
-  mnemonic <password>
+  mnemonic [password] | dumpprivkey <address> [password]
   peers | addnode <http://host:port> | fees | sync | lang [zh|en|ru|ja] | stop
 `);
 }
@@ -208,6 +211,58 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
   core.bus.on("shutdown", () => application.unmount());
 }
 
+async function startConsole(paths: CliPaths): Promise<void> {
+  const { config, warnings } = resolveConfig(paths);
+  mkdirSync(config.datadir, { recursive: true });
+  initGlobalData();
+  applyStoredLang(config.datadir);
+  // Keep log lines off the shared console output: the session prints its own
+  // transcript and re-renders the prompt around in-band log lines.
+  const log = new Logger({ console: false, file: path.join(config.datadir, "dexcoin.log") });
+  warnings.forEach((warning) => log.warn(warning));
+  if (!hasWalletFile(config.datadir)) {
+    console.error(`Wallet not initialized: ${vaultFilePath(config.datadir)} missing; run init first`);
+    process.exit(1);
+  }
+  const loaded = await loadExistingWallet(config, log);
+  const { core, registry, game } = buildServices(config, loaded.key, log, loaded.password);
+  const rpc = startWalletRpc(config, core, log);
+  try {
+    await core.start();
+    game?.start();
+  } catch (error) {
+    rpc?.stop();
+    game?.stop();
+    console.error(`Startup failed: ${(error as Error).message}`);
+    process.exit(1);
+  }
+
+  let exiting = false;
+  const exit = () => {
+    if (exiting) return;
+    exiting = true;
+    rpc?.stop();
+    game?.stop();
+    void core.stop().finally(() => process.exit(0));
+  };
+  core.bus.on("shutdown", exit);
+  process.on("SIGTERM", exit);
+
+  const commandContext = {
+    core,
+    log,
+    interactive: true,
+    password: loaded.password,
+    datadir: config.datadir,
+  };
+  log.info(t("log.consoleStarted", { summary: serviceSummary(config) }));
+  await runConsoleWithReadline(registry, commandContext, log, {
+    write: (line) => console.log(line),
+    prompt: "edx> ",
+    onExit: exit,
+  });
+}
+
 async function initWallet(paths: CliPaths, args: string[]): Promise<void> {
   const { config, warnings } = resolveConfig(paths);
   initGlobalData();
@@ -286,6 +341,7 @@ async function main(): Promise<void> {
   const [command, ...args] = rest;
   if (!command || command === "start") return startWallet(paths, true);
   if (command === "daemon") return startWallet(paths, false);
+  if (command === "console" || command === "cli") return startConsole(paths);
   if (command === "init") return initWallet(paths, args);
   return runOneShot(command, args, paths);
 }

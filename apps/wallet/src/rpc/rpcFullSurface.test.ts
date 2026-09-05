@@ -121,8 +121,8 @@ function fakeConn(overrides: Record<string, unknown> = {}): ConnectionManager {
   } as unknown as ConnectionManager;
 }
 
-function stubCore(conn: ConnectionManager): WalletCore {
-  return {
+function stubCore(conn: ConnectionManager, overrides: Record<string, unknown> = {}): WalletCore {
+  const base = {
     conn,
     key: { address: ADDRESS, privateKey: new Uint8Array(32), publicKey: new Uint8Array(33) },
     chain: {
@@ -237,7 +237,8 @@ function stubCore(conn: ConnectionManager): WalletCore {
     requestStop: () => undefined,
     getMiningJob: async () => ({ jobId: "job-1", height: 12, previousblockhash: "b".repeat(64), blob: "00ed", seedHash: "f".repeat(64), target: "ff", difficulty: "1000000", coinbasevalue: "400.00000000" }),
     database: { isOpen: false, blockAt: () => null, localHeight: () => -1 } as unknown as WalletCore["database"],
-  } as unknown as WalletCore;
+  };
+  return { ...base, ...overrides } as unknown as WalletCore;
 }
 
 async function rpcCall(server: WalletRpcServer, method: string, params: unknown[] = []): Promise<{ result?: unknown; error?: { code: number; message: string } }> {
@@ -253,9 +254,9 @@ async function rpcCall(server: WalletRpcServer, method: string, params: unknown[
 describe("wallet RPC full surface", () => {
   afterEach(() => {});
 
-  function makeServer(): { server: WalletRpcServer; conn: ConnectionManager } {
+  function makeServer(overrides: Record<string, unknown> = {}): { server: WalletRpcServer; conn: ConnectionManager } {
     const conn = fakeConn();
-    const server = new WalletRpcServer(createConfig() as never, stubCore(conn), {} as never);
+    const server = new WalletRpcServer(createConfig() as never, stubCore(conn, overrides), {} as never);
     return { server, conn };
   }
 
@@ -532,6 +533,130 @@ describe("wallet RPC full surface", () => {
     expect(badParams.error?.code).toBe(-32602);
     const badCount = await rpcCall(server, "sendtoaddress", [ADDRESS]);
     expect(badCount.error?.code).toBe(-32602);
+    server.stop();
+  });
+
+  // ---- pagination and Bitcoin parameter tolerance ----
+
+  function txAt(index: number): { txid: string } & Record<string, unknown> {
+    const txid = `a${String(index).padStart(63, "0")}`;
+    return {
+      txid,
+      type: "transfer",
+      category: index % 2 === 0 ? "send" : "receive",
+      amount: "1.00000000",
+      fee: "0.00010000",
+      status: "confirmed",
+      confirmations: index + 1,
+      matureAtHeight: null,
+      height: index,
+      time: 1_700_000_000 + index,
+      from: ADDRESS,
+      inputs: [],
+      outputs: [{ address: ADDRESS, amount: "1.00000000", isChange: false }],
+    };
+  }
+
+  test("listtransactions windows by count and skip without overlap or loss", async () => {
+    const total = 45;
+    const txs = Array.from({ length: total }, (_unused, index) => txAt(index));
+    const { server } = makeServer({
+      listTransactions: async (_limit = 20, _skip = 0) => txs.slice(_skip, _skip + _limit),
+    });
+    const first = await rpcCall(server, "listtransactions", [20]);
+    const firstIds = (first.result as Array<{ txid: string }>).map((row) => row.txid);
+    expect(firstIds.length).toBe(20);
+    const second = await rpcCall(server, "listtransactions", [20, 20]);
+    const secondIds = (second.result as Array<{ txid: string }>).map((row) => row.txid);
+    expect(secondIds.length).toBe(20);
+    expect(new Set([...firstIds, ...secondIds]).size).toBe(40);
+    const third = await rpcCall(server, "listtransactions", [20, 40]);
+    expect((third.result as unknown[]).length).toBe(5);
+    const defaulted = await rpcCall(server, "listtransactions", []);
+    expect(defaulted.result).toBeDefined();
+    server.stop();
+  });
+
+  test("listtransactions tolerates the leading bitcoin label parameter", async () => {
+    const total = 30;
+    const txs = Array.from({ length: total }, (_unused, index) => txAt(index));
+    const { server } = makeServer({
+      listTransactions: async (_limit = 20, _skip = 0) => txs.slice(_skip, _skip + _limit),
+    });
+    // ["label", count, skip] — the label is accepted and ignored.
+    const labeled = await rpcCall(server, "listtransactions", ["main", 10, 20]);
+    const ids = (labeled.result as Array<{ txid: string }>).map((row) => row.txid);
+    expect(ids.length).toBe(10);
+    expect(ids[0]).toBe(txAt(20).txid);
+    // Invalid windows are still rejected with -32602.
+    expect((await rpcCall(server, "listtransactions", [0])).error?.code).toBe(-32602);
+    expect((await rpcCall(server, "listtransactions", [600])).error?.code).toBe(-32602);
+    expect((await rpcCall(server, "listtransactions", ["main", 5, -1])).error?.code).toBe(-32602);
+    server.stop();
+  });
+
+  test("listunspent paginates through query_options and validates windows", async () => {
+    const unspents = Array.from({ length: 6 }, (_unused, index) => ({
+      txid: `b${String(index).padStart(63, "0")}`,
+      index: 0,
+      address: ADDRESS,
+      amount: "10.00000000",
+      confirmations: index + 1,
+    }));
+    const { server } = makeServer({ listUnspent: async () => unspents });
+    const page = await rpcCall(server, "listunspent", [0, 9999999, [], false, { count: 2, skip: 1 }]);
+    const rows = page.result as Array<{ txid: string }>;
+    expect(rows.length).toBe(2);
+    expect(rows[0]!.txid).toBe(unspents[1]!.txid);
+    expect(rows[1]!.txid).toBe(unspents[2]!.txid);
+    const badOptions = await rpcCall(server, "listunspent", [0, 9999999, [], false, { count: 0 }]);
+    expect(badOptions.error?.code).toBe(-32602);
+    server.stop();
+  });
+
+  test("scantxoutset windows unspents via scaninfo but keeps full totals", async () => {
+    const unspents = Array.from({ length: 5 }, (_unused, index) => ({
+      txid: `c${String(index).padStart(63, "0")}`,
+      vout: 0,
+      address: ADDRESS,
+      amount: "1.00000000",
+      confirmations: index + 1,
+      scriptPubKey: "",
+    }));
+    const { server } = makeServer({
+      scanTxOutSet: async () => ({ success: true, txouts: 5, total_amount: "5.00000000", unspents }),
+    });
+    const scan = await rpcCall(server, "scantxoutset", ["start", [`addr(${ADDRESS})`], { count: 2, skip: 2 }]);
+    const result = scan.result as { success: boolean; txouts: number; total_amount: string; unspents: Array<{ txid: string }> };
+    expect(result.success).toBe(true);
+    expect(result.txouts).toBe(5);
+    expect(result.total_amount).toBe("5.00000000");
+    expect(result.unspents.length).toBe(2);
+    expect(result.unspents[0]!.txid).toBe(unspents[2]!.txid);
+    server.stop();
+  });
+
+  test("listaddresses windows every derived wallet address", async () => {
+    const addresses = Array.from({ length: 4 }, (_unused, index) => ADDRESS.slice(0, -1) + String(index));
+    const { server } = makeServer({ walletAddresses: () => addresses });
+    const page = await rpcCall(server, "listaddresses", [2, 1]);
+    const rows = page.result as string[];
+    expect(rows.length).toBe(2);
+    expect(rows[0]).toBe(addresses[1]);
+    const all = await rpcCall(server, "listaddresses", []);
+    expect((all.result as string[]).length).toBe(4);
+    expect((await rpcCall(server, "listaddresses", [0])).error?.code).toBe(-32602);
+    server.stop();
+  });
+
+  test("sendtoaddress and sendmany tolerate trailing bitcoin-style parameters", async () => {
+    const { server } = makeServer();
+    // Fee in position 3; comment-like extras, numbers and booleans after it
+    // are accepted and ignored rather than rejected as parameter errors.
+    const extra = await rpcCall(server, "sendtoaddress", [ADDRESS, "1.00000000", "0.00010000", "lunch", "friend", 3, true]);
+    expect(extra.result).toBe("f".repeat(64));
+    const many = await rpcCall(server, "sendmany", ["dummy", { [ADDRESS]: "0.50000000" }, 0, "note", "note2"]);
+    expect(many.result).toBe("f".repeat(64));
     server.stop();
   });
 

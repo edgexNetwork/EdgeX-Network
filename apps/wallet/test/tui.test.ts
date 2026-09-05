@@ -108,11 +108,16 @@ describe("legacy TUI structure", () => {
     address: "EDXADDRESS",
     receiveAddresses: ["EDXADDRESS"],
     receiveIndex: 0,
+    receivePage: ["EDXADDRESS"],
+    receivePageIndex: 0,
+    receivePageCount: 1,
     selfP2pUrl: "",
     requirePassword: true,
     peersText: "",
     qr: ["###"],
     copyMsg: null,
+    version: "1.0.0",
+    datadir: temporaryDirectory,
   };
   const actions = {
     refresh: () => {},
@@ -128,13 +133,19 @@ describe("legacy TUI structure", () => {
     showTx: () => {},
     selectReceiveAddress: () => {},
     newReceiveAddress: () => {},
+    receivePageBy: () => {},
+    resync: () => {},
+    showMnemonic: () => {},
+    showPrivkey: () => {},
+    showWalletInfo: () => {},
     reconnect: () => {},
     scrollBy: () => {},
   };
 
-  test("preserves seven tabs, dual-mode button, and localized labels", () => {
-    expect(TABS.map((tab) => tab.name)).toEqual(["balance", "send", "receive", "history", "network", "fees", "logs"]);
+  test("preserves eight tabs, dual-mode button, and localized labels", () => {
+    expect(TABS.map((tab) => tab.name)).toEqual(["balance", "send", "receive", "history", "network", "fees", "logs", "settings"]);
     expect(tabLabel("balance")).toBe("01 余额");
+    expect(tabLabel("settings")).toBe("08 设置");
     expect(modeButtonLabel("mouse")).toBe("[切换: 命令 Ctrl+B]");
   });
 
@@ -144,6 +155,35 @@ describe("legacy TUI structure", () => {
       expect(result.rows.length).toBeGreaterThan(0);
       result.rows.forEach((row) => expect(row.text).toBeDefined());
     }
+  });
+
+  test("renders the settings view with wallet info and action rows", () => {
+    const result = buildView("settings", snapshot as never, actions);
+    const text = result.rows.map((row) => row.text).join("\n");
+    expect(text).toContain(t("tab.settings"));
+    expect(result.rows.some((row) => row.text.includes(t("settings.resync")))).toBe(true);
+    expect(result.rows.some((row) => row.text.includes(t("settings.mnemonic")))).toBe(true);
+    expect(result.rows.some((row) => row.text.includes(t("settings.privkey")))).toBe(true);
+    // Four clickable actions are registered as regions.
+    expect(result.regions.length).toBeGreaterThanOrEqual(4);
+  });
+
+  test("paginates the receive address list with prev/next regions", () => {
+    const manyAddresses = Array.from({ length: 45 }, (_unused, i) => `EDXADDRESS${String(i).padStart(2, "0")}`);
+    const pagedSnapshot = {
+      ...snapshot,
+      receiveAddresses: manyAddresses,
+      receivePage: manyAddresses.slice(0, 20),
+      receivePageIndex: 0,
+      receivePageCount: 3,
+    };
+    const result = buildView("receive", pagedSnapshot as never, actions);
+    const text = result.rows.map((row) => row.text).join("\n");
+    expect(text).toContain(t("receive.prevPage"));
+    expect(text).toContain(t("receive.nextPage"));
+    expect(text).toContain(t("receive.pageOf", { page: 1, total: 3 }));
+    expect(text).toContain("01");
+    expect(result.regions.some((region) => region.x0 === 0 && region.x1 > 0)).toBe(true);
   });
 
   test("merges command sessions and logs in command mode", () => {

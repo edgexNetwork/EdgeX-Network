@@ -4,6 +4,7 @@ import type { TxView } from "../api/types";
 import type { Logger } from "../utils/log";
 import type { WalletConfig } from "../config/config";
 import { decodeBlockHex, submitBlock } from "../core/rpcCore";
+import { DEFAULT_HISTORY_COUNT, parseCount, parseSkip } from "../core/paging";
 
 const RPC_PARSE_ERROR = -32700;
 const RPC_INVALID_REQUEST = -32600;
@@ -164,7 +165,11 @@ export class WalletRpcServer {
         return this.core.getNewAddress(label);
       }
       case "sendtoaddress": {
-        this.requireParams(params, 2, 4);
+        // bitcoind parameter surface: <address> <amount> followed by optional
+        // comment/comment_to/fee_rate/subtract_fee_from_amount arguments that
+        // EDX does not model. Extra optional parameters are tolerated and
+        // ignored so standard Bitcoin wallet tooling keeps working.
+        this.requireParams(params, 2, 9);
         const [to, amount, fee, password] = params;
         if (typeof to !== "string" || (typeof amount !== "string" && typeof amount !== "number")) {
           throw parameterError("sendtoaddress parameter error: <address> <amount> [fee] [password]");
@@ -188,11 +193,23 @@ export class WalletRpcServer {
         return transactionDto(transaction);
       }
       case "listtransactions": {
-        this.requireParams(params, 0, 2);
-        const count = typeof params[0] === "number" ? Math.floor(params[0]) : 20;
-        const skip = typeof params[1] === "number" ? Math.floor(params[1]) : 0;
-        const all = await this.core.listTransactions(count + skip);
-        return all.slice(skip).map(transactionDto);
+        // bitcoind parameter surface: [label] [count] [skip] [include_watchonly].
+        // The leading label is a string in Bitcoin Core; when present it is
+        // accepted and ignored because EDX wallets have no labels. count/skip
+        // window the merged wallet history (count defaults to 20).
+        this.requireParams(params, 0, 4);
+        let count: unknown = params[0];
+        let skip: unknown = params[1];
+        if (typeof params[0] === "string") {
+          count = params[1];
+          skip = params[2];
+        }
+        const parsedCount = parseCount(count, DEFAULT_HISTORY_COUNT);
+        const parsedSkip = parseSkip(skip);
+        const all = await this.core.listTransactions(parsedCount, parsedSkip);
+        // The core honors (limit, skip); the extra slice guards stubs and
+        // future core changes that might over-return.
+        return all.slice(0, parsedCount).map(transactionDto);
       }
       case "estimatesmartfee": {
         const fees = await this.core.getFees(true);
@@ -209,10 +226,23 @@ export class WalletRpcServer {
 
       // ---- transfers ----
       case "sendmany": {
-        this.requireParams(params, 2, 3);
-        const [dummy, amounts, password] = params;
+        // bitcoind surface: <dummyaccount> <amounts> [minconf] [comment]
+        // [subtractfeefromamount] [replaceable] [conf_target] [estimate_mode]
+        // [fee_rate] [verbose]. Optional parameters after the amounts map are
+        // tolerated and ignored; a trailing string argument is the wallet
+        // password (EDX extension) when the vault requires one.
+        this.requireParams(params, 2, 10);
+        const [dummy, amounts, ...rest] = params;
         if (typeof amounts !== "object" || amounts === null || Array.isArray(amounts)) {
           throw parameterError("sendmany requires an amounts object {address: amount}");
+        }
+        let password: unknown;
+        for (let index = rest.length - 1; index >= 0; index -= 1) {
+          const candidate = rest[index];
+          if (typeof candidate === "string" && candidate !== "true" && candidate !== "false") {
+            password = candidate;
+            break;
+          }
         }
         const payments = Object.entries(amounts as Record<string, unknown>).map(([address, amount]) => ({
           address,
@@ -323,12 +353,19 @@ export class WalletRpcServer {
         return this.core.getAddressInfo(params[0]);
       }
       case "listunspent": {
-        this.requireParams(params, 0, 3);
+        // bitcoind surface: [minconf] [maxconf] [addresses] [include_unsafe]
+        // [query_options]. Pagination travels inside query_options as
+        // {count, skip} (count default 100, capped at 500).
+        this.requireParams(params, 0, 5);
         const minconf = typeof params[0] === "number" ? Math.floor(params[0]) : 0;
         const maxconf = typeof params[1] === "number" ? Math.floor(params[1]) : 9999999;
         const addresses = Array.isArray(params[2]) ? (params[2] as unknown[]).filter((a): a is string => typeof a === "string") : undefined;
+        const options = params[4] as { count?: unknown; skip?: unknown } | undefined;
+        const count = parseCount(options?.count);
+        const skip = parseSkip(options?.skip);
         const utxos = await this.core.listUnspent(minconf, maxconf, addresses);
-        return utxos.map((u) => ({
+        const window = utxos.slice(skip, skip + count);
+        return window.map((u) => ({
           txid: u.txid,
           vout: u.index,
           address: u.address,
@@ -338,6 +375,15 @@ export class WalletRpcServer {
           solvable: true,
           safe: true,
         }));
+      }
+      case "listaddresses": {
+        // EDX extension: every derived wallet address (external + internal),
+        // main address first, windowed by [count] [skip].
+        this.requireParams(params, 0, 2);
+        const count = parseCount(params[0]);
+        const skip = parseSkip(params[1]);
+        const all = this.core.walletAddresses();
+        return all.slice(skip, skip + count);
       }
       case "listsinceblock": {
         const blockhash = typeof params[0] === "string" ? params[0] : undefined;
@@ -411,18 +457,29 @@ export class WalletRpcServer {
 
       // ---- UTXO, mempool and fees ----
       case "scantxoutset": {
-        // bitcoind semantics: "start <scanobjects>" scans the full-chain UTXO
-        // set for the given addresses; "abort" and "status" only report that
-        // the synchronous scan cannot be interrupted.
-        this.requireParams(params, 1, 2);
-        const [action, scanobjects] = params;
+        // bitcoind semantics: "start <scanobjects> [scaninfo]" scans the
+        // full-chain UTXO set for the given addresses; scaninfo carries
+        // {count, skip} for windowing the unspents (txouts and total_amount
+        // always reflect the whole match set). "abort" and "status" only
+        // report that the synchronous scan cannot be interrupted.
+        this.requireParams(params, 1, 3);
+        const [action, scanobjects, scaninfo] = params;
         if (action === "abort" || action === "status") {
           return { success: false, txouts: 0, total_amount: "0.00000000", unspents: [] };
         }
         if (action !== "start" || !Array.isArray(scanobjects)) {
-          throw parameterError("scantxoutset requires start <scanobjects> | abort | status");
+          throw parameterError("scantxoutset requires start <scanobjects> [scaninfo] | abort | status");
         }
-        return this.core.scanTxOutSet(scanobjects);
+        const info = scaninfo as { count?: unknown; skip?: unknown } | undefined;
+        const count = parseCount(info?.count);
+        const skip = parseSkip(info?.skip);
+        const result = await this.core.scanTxOutSet(scanobjects);
+        return {
+          success: result.success,
+          txouts: result.txouts,
+          total_amount: result.total_amount,
+          unspents: result.unspents.slice(skip, skip + count),
+        };
       }
       case "gettxout": {
         this.requireParams(params, 2, 2);

@@ -14,6 +14,9 @@ export interface CommandContext {
 
   ask?: AskFn;
 
+  /** Prompt for a secret without echoing; used by password confirmation. */
+  askSecret?: (prompt: string) => Promise<string>;
+
   datadir?: string;
 }
 

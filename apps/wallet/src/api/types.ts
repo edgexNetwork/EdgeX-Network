@@ -77,3 +77,21 @@ export interface UtxoDTO {
   isCoinbase: boolean;
   spendable: boolean;
 }
+
+/** Paging bounds shared by every list surface (RPC, CLI, TUI). */
+export const PAGE_DEFAULT = 100;
+export const PAGE_MAX = 500;
+export const PAGE_MIN = 1;
+
+export interface PagedQuery {
+  count?: number;
+  skip?: number;
+}
+
+/** Windowed slice of a larger result set, carrying the total for paging UI. */
+export interface PageResult<T> {
+  items: T[];
+  total: number;
+  count: number;
+  skip: number;
+}

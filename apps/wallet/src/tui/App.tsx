@@ -19,6 +19,7 @@ import {
   emptySendDraft,
   MAX_RECIPIENTS,
   modeButtonLabel,
+  RECEIVE_PAGE_SIZE,
   tabLabel,
   TABS,
   type FocusTarget,
@@ -568,6 +569,121 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
     }
   };
 
+  /** Open a password-confirmation dialog whose onConfirm runs the given action. */
+  const askPasswordDialog = (title: string, lines: string[], onConfirm: (password: string) => void) => {
+    setDialogSel("confirm");
+    setDialogPassword("");
+    dialogPasswordRef.current = "";
+    setDialog({
+      title,
+      lines: [...lines, t("dialog.walletPassword")],
+      confirmText: t("ui.ok"),
+      cancelText: t("ui.cancel"),
+      password: true,
+      onConfirm: () => {
+        setDialog(null);
+        onConfirm(dialogPasswordRef.current);
+      },
+      onCancel: () => setDialog(null),
+    });
+  };
+
+  /** Show a read-only dialog carrying sensitive material (no cancel affordance needed). */
+  const showSensitive = (title: string, body: string[]) => {
+    setDialogSel("confirm");
+    setDialog({
+      title,
+      lines: body,
+      confirmText: t("ui.close"),
+      hideButtons: true,
+      onConfirm: () => setDialog(null),
+      onCancel: () => setDialog(null),
+    });
+  };
+
+  /** Settings page: full local chain rebuild, guarded by a confirm dialog. */
+  const settingsResync = () => {
+    setDialogSel("confirm");
+    setDialog({
+      title: t("settings.confirmResyncTitle"),
+      lines: [t("settings.resyncLine")],
+      confirmText: t("settings.resyncYes"),
+      cancelText: t("settings.resyncNo"),
+      onConfirm: () => {
+        setDialog(null);
+        void (async () => {
+          try {
+            await core.resync();
+            refresh();
+            log.info(t("settings.resyncDone"));
+          } catch (e) {
+            log.error(`Resync failed: ${(e as Error).message}`);
+          }
+        })();
+      },
+      onCancel: () => setDialog(null),
+    });
+  };
+
+  /** Settings page: show the wallet mnemonic after an interactive password check. */
+  const settingsShowMnemonic = () => {
+    askPasswordDialog(t("settings.mnemonic"), [], (password) => {
+      try {
+        const mnemonic = core.getMnemonic(password.trim() === "" ? "" : password);
+        showSensitive(t("settings.titleMnemonic"), [mnemonic]);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        log.error(`Mnemonic export failed: ${message}`);
+        showSensitive(t("settings.mnemonic"), [message]);
+      }
+    });
+  };
+
+  /** Settings page: show the main-address private key after an interactive password check. */
+  const settingsShowPrivkey = () => {
+    askPasswordDialog(t("settings.privkey"), [], (password) => {
+      try {
+        const wif = core.dumpPrivKey(core.getAddress(), password.trim() === "" ? "" : password);
+        showSensitive(t("settings.titlePrivkey"), [wif]);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        log.error(`Private key export failed: ${message}`);
+        showSensitive(t("settings.privkey"), [message]);
+      }
+    });
+  };
+
+  /** Settings page: show the wallet-info dialog. */
+  const settingsShowWalletInfo = () => {
+    const info = core.getWalletInfo();
+    const addresses = core.walletAddresses();
+    setDialogSel("confirm");
+    setDialog({
+      title: t("settings.walletInfo"),
+      lines: [
+        t("dialog.walletName", { name: info.walletname }),
+        t("settings.addresses", { count: String(addresses.length) }),
+        t("settings.balanceLine", { balance: trimEDX(info.balance), ticker: COIN_TICKER }),
+      ],
+      confirmText: t("ui.close"),
+      onConfirm: () => setDialog(null),
+      onCancel: () => setDialog(null),
+    });
+  };
+
+  /** Step the visible receive address page (wraps around the page count). */
+  const receivePageBy = (delta: number) => {
+    const all = core.walletAddresses();
+    const count = all.length;
+    const pageCount = Math.max(1, Math.ceil(Math.max(1, count) / RECEIVE_PAGE_SIZE));
+    const currentPage = Math.floor(Math.min(Math.max(0, receiveIndex), Math.max(0, count - 1)) / RECEIVE_PAGE_SIZE);
+    const nextPage = ((currentPage + delta) % pageCount + pageCount) % pageCount;
+    const target = Math.min(nextPage * RECEIVE_PAGE_SIZE, count - 1);
+    setReceiveIndex(Math.max(0, target));
+    setCopyMsg(null);
+    refresh();
+  };
+
   const runCommand = (line: string) => {
     const id = sessionIdRef.current++;
     setSessions((prev) => [...prev.slice(-199), { id, line, output: [], ts: Date.now() }]);
@@ -786,6 +902,15 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
       return `${p.id} ${source} ${p.addr} ${p.connected ? t("peer.connected") : t("peer.disconnected")}`;
     })
     .join("\n");
+  // Windowed receive-address page: the page that holds the selected address.
+  const allReceiveAddresses = core.walletAddresses();
+  const safeReceiveIndex = Math.min(receiveIndex, Math.max(0, allReceiveAddresses.length - 1));
+  const receivePageIndex = Math.max(
+    0,
+    Math.floor(Math.max(0, safeReceiveIndex) / RECEIVE_PAGE_SIZE),
+  );
+  const receivePage = allReceiveAddresses.slice(receivePageIndex * RECEIVE_PAGE_SIZE, (receivePageIndex + 1) * RECEIVE_PAGE_SIZE);
+  const receivePageCount = Math.ceil(Math.max(1, allReceiveAddresses.length) / RECEIVE_PAGE_SIZE);
   const viewResult = buildView(
     view,
     {
@@ -807,14 +932,19 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
       cols,
       mainH,
       address: core.getAddress(),
-      receiveAddresses: core.walletAddresses(),
-      receiveIndex: Math.min(receiveIndex, Math.max(0, core.walletAddresses().length - 1)),
+      receiveAddresses: allReceiveAddresses,
+      receiveIndex: safeReceiveIndex,
+      receivePage,
+      receivePageIndex,
+      receivePageCount,
       totalNodes: core.getPeers().length,
       selfP2pUrl: core.conn.selfPublicUrl(),
       requirePassword: core.requirePassword(),
       peersText,
       qr,
       copyMsg,
+      version: "1.0.0",
+      datadir: config.datadir,
     },
     {
       refresh,
@@ -828,6 +958,11 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
       showTx,
       selectReceiveAddress,
       newReceiveAddress,
+      receivePageBy,
+      resync: settingsResync,
+      showMnemonic: settingsShowMnemonic,
+      showPrivkey: settingsShowPrivkey,
+      showWalletInfo: settingsShowWalletInfo,
       reconnect: () => {
         void core.conn.refreshConnection();
         refresh();

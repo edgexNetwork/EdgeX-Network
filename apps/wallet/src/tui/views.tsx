@@ -7,7 +7,7 @@ import { FEE_TIER_NAMES, type FeeTierName } from "../core/fee";
 import { currentLocale, t } from "../i18n";
 import { C } from "./theme";
 
-export type ViewName = "balance" | "send" | "receive" | "history" | "network" | "fees" | "logs";
+export type ViewName = "balance" | "send" | "receive" | "history" | "network" | "fees" | "logs" | "settings";
 export type FocusTarget = "command" | "to" | "amount" | "fee" | "sendBtn" | "resetBtn" | "addRow" | "delRow";
 export type UiMode = "mouse" | "command";
 
@@ -25,6 +25,7 @@ export const TABS: { name: ViewName }[] = [
   { name: "network" },
   { name: "fees" },
   { name: "logs" },
+  { name: "settings" },
 ];
 
 const TAB_NUM: Record<ViewName, string> = {
@@ -35,6 +36,7 @@ const TAB_NUM: Record<ViewName, string> = {
   network: "05",
   fees: "06",
   logs: "07",
+  settings: "08",
 };
 
 
@@ -90,6 +92,9 @@ export interface RecipientDraft {
 
 export const MAX_RECIPIENTS = 5;
 
+/** Address rows shown per page in the receive all-addresses list. */
+export const RECEIVE_PAGE_SIZE = 20;
+
 export interface SendDraft {
 
   recipients: RecipientDraft[];
@@ -139,6 +144,17 @@ export interface ViewSnapshot {
   qr: string[] | null;
 
   copyMsg: string | null;
+
+  /** Wallet software version shown on the settings page. */
+  version: string;
+  /** Every derived address on the current receive page (page-sized window). */
+  receivePage: string[];
+  /** Zero-based page number of the visible receive page window. */
+  receivePageIndex: number;
+  /** Total receive-address pages (0 when the list is empty). */
+  receivePageCount: number;
+  /** Data directory shown on the settings page. */
+  datadir: string;
 }
 
 export interface ViewActions {
@@ -162,6 +178,16 @@ export interface ViewActions {
   selectReceiveAddress: (index: number) => void;
   /** Derive a fresh receive address and select it on the receive page. */
   newReceiveAddress: () => void;
+  /** Step the visible receive address list by one page (wraps around). */
+  receivePageBy: (delta: number) => void;
+  /** Full local chain rebuild (settings page action). */
+  resync: () => void;
+  /** Show the wallet mnemonic after interactive password confirmation. */
+  showMnemonic: () => void;
+  /** Show the private key of the wallet main address after password confirmation. */
+  showPrivkey: () => void;
+  /** Show the wallet information dialog. */
+  showWalletInfo: () => void;
   reconnect: () => void;
   scrollBy: (d: number) => void;
 }
@@ -851,25 +877,65 @@ function receiveView(snap: ViewSnapshot, actions: ViewActions): ViewResult {
   const copyX0 = w2(current) + 1;
   regions.push({ y: 1, x0: copyX0, x1: copyX0 + w2(copyBtn) - 1, action: actions.copyAddress });
 
-  // Every derived address, newest last; clicking a row switches to it.
+  // Every derived address (external + internal), newest last; the list is
+  // windowed to one page of rows and clicking a row switches to that address.
+  // When the snapshot carries no page window yet the first page is derived.
+  // The number of visible rows is capped so the pagination footer stays on
+  // screen; rows beyond the cap remain reachable via the next-page control.
+  const pageRowsRaw =
+    snap.receivePage.length > 0 ? snap.receivePage : addresses.slice(0, RECEIVE_PAGE_SIZE);
+  const pageIndex =
+    snap.receivePage.length > 0 ? snap.receivePageIndex : 0;
+  const pageCount =
+    snap.receivePageCount > 0 ? snap.receivePageCount : Math.ceil(Math.max(1, count) / RECEIVE_PAGE_SIZE);
+  const hasMore = pageCount > 1;
   if (count > 1) {
     rows.push({ text: "", color: C.grayDim });
     rows.push(boxTop(snap.cols, t("receive.allAddresses")));
-    addresses.forEach((address, i) => {
-      const mark = i === index ? `${t("receive.currentMark")} ` : "";
-      const label = `${String(i + 1).padStart(2, "0")} ${mark}${address}`;
+    // Reserve rows below the list for the pagination footer and the button
+    // row; the address list never grows past the visible main area.
+    const listLimit = Math.max(1, Math.min(pageRowsRaw.length, snap.mainH - 11));
+    const pageRows = pageRowsRaw.slice(0, listLimit);
+    pageRows.forEach((address, i) => {
+      const globalIndex = pageIndex * RECEIVE_PAGE_SIZE + i;
+      const mark = address === current ? `${t("receive.currentMark")} ` : "";
+      const label = `${String(globalIndex + 1).padStart(2, "0")} ${mark}${address}`;
       const row = rows.length;
       rows.push({
         text: label,
         segments: closeEdge([
-          { text: String(i + 1).padStart(2, "0"), color: C.grayDim },
+          { text: String(globalIndex + 1).padStart(2, "0"), color: C.grayDim },
           { text: " ", color: undefined },
           { text: mark, color: C.bright },
-          { text: address, bold: i === index, color: i === index ? C.cyan : C.fg },
+          { text: address, bold: address === current, color: address === current ? C.cyan : C.fg },
         ], snap.cols),
       });
-      regions.push({ y: row, x0: 0, x1: viewWidth(snap.cols), action: () => actions.selectReceiveAddress(i) });
+      regions.push({ y: row, x0: 0, x1: viewWidth(snap.cols), action: () => actions.selectReceiveAddress(globalIndex) });
     });
+    if (hasMore) {
+      // Pagination footer: page indicator plus clickable prev/next regions.
+      const pagingText = `[${t("receive.prevPage")}] ${t("receive.pageOf", {
+        page: pageIndex + 1,
+        total: pageCount,
+      })} [${t("receive.nextPage")}]`;
+      const row = rows.length;
+      rows.push({
+        text: pagingText,
+        segments: [
+          { text: `[${t("receive.prevPage")}] `, color: C.fg, bold: true },
+          { text: t("receive.pageOf", { page: pageIndex + 1, total: pageCount }), color: C.gray },
+          { text: ` [${t("receive.nextPage")}]`, color: C.fg, bold: true },
+        ],
+      });
+      const prevX1 = w2(`[${t("receive.prevPage")}]`);
+      const pageX0 = prevX1 + 1;
+      const pageX1 = pageX0 + w2(t("receive.pageOf", { page: pageIndex + 1, total: pageCount })) - 1;
+      regions.push(
+        { y: row, x0: 0, x1: prevX1 - 1, action: () => actions.receivePageBy(-1) },
+        { y: row, x0: pageX0, x1: pageX1, action: () => {} },
+        { y: row, x0: pageX1 + 1, x1: viewWidth(snap.cols), action: () => actions.receivePageBy(1) },
+      );
+    }
     rows.push(boxBottom(snap.cols));
   }
 
@@ -958,6 +1024,84 @@ function historyView(snap: ViewSnapshot, actions: ViewActions): ViewResult {
   if (snap.txs.length > maxRows) {
     rows.push({ text: t("history.paging", { start: start + 1, end: start + visible.length, total: snap.txs.length }), color: C.gray });
   }
+  return { rows, regions };
+}
+
+function settingsView(snap: ViewSnapshot, actions: ViewActions): ViewResult {
+  const rows: Row[] = [];
+  const regions: Region[] = [];
+  rows.push(sectionHeader(t("tab.settings")));
+
+  rows.push(boxTop(snap.cols, t("settings.infoCard")));
+  const chain = snap.chain;
+  const height = chain ? formatNumber(chain.blocks) : "-";
+  const syncLabel =
+    chain === null || chain.syncStatus === "none"
+      ? "-"
+      : chain.syncStatus === "synced"
+        ? t("sync.synced")
+        : chain.syncStatus === "error"
+          ? t("sync.error")
+          : t("sync.syncing");
+  const infoLines = [
+    { text: t("settings.addresses", { count: formatNumber(Math.max(0, snap.receiveAddresses.length)) }), color: C.fg },
+    { text: t("settings.encrypted", { state: snap.requirePassword ? t("settings.encryptedYes") : t("settings.encryptedNo") }), color: C.gray },
+    { text: t("settings.height", { height }), color: C.gray },
+    { text: t("settings.sync", { state: syncLabel }), color: chain && chain.syncStatus === "error" ? C.red : chain && chain.syncStatus === "syncing" ? C.amber : C.gray },
+    { text: t("settings.version", { version: snap.version }), color: C.gray },
+  ];
+  for (const line of infoLines) {
+    rows.push({
+      text: `│ ${line.text}`,
+      segments: closeEdge([{ text: "│ ", color: C.borderDim }, { text: line.text, color: line.color }], snap.cols),
+    });
+  }
+  // The data directory may exceed the terminal width; it is truncated with an
+  // ellipsis instead of wrapping so the info card stays one row tall.
+  const datadirShown = fitW(snap.datadir, Math.max(10, viewWidth(snap.cols) - 16));
+  rows.push({
+    text: `│ ${t("settings.datadir", { datadir: datadirShown })}`,
+    segments: closeEdge([{ text: "│ ", color: C.borderDim }, { text: t("settings.datadir", { datadir: datadirShown }), color: C.grayDim }], snap.cols),
+  });
+  rows.push(boxBottom(snap.cols));
+
+  rows.push({ text: "", color: C.grayDim });
+  rows.push(boxTop(snap.cols, t("settings.actionsCard")));
+  const actionsList: Array<{ label: string; action: () => void }> = [
+    { label: `[${t("settings.resync")}]`, action: actions.resync },
+    { label: `[${t("settings.mnemonic")}]`, action: actions.showMnemonic },
+    { label: `[${t("settings.privkey")}]`, action: actions.showPrivkey },
+    { label: `[${t("settings.walletInfo")}]`, action: actions.showWalletInfo },
+  ];
+  const actionRow = rows.length;
+  let actionX = 0;
+  const actionSegments: RowSegment[] = [];
+  for (const item of actionsList) {
+    const y = actionRow;
+    const x0 = actionX;
+    const x1 = x0 + w2(item.label) - 1;
+    regions.push({ y, x0, x1, action: item.action });
+    actionSegments.push(
+      { text: "[", color: C.border, bg: C.bg, bold: true },
+      { text: item.label.slice(1, -1), color: C.fg, bg: C.bg, bold: true },
+      { text: "]", color: C.border, bg: C.bg, bold: true },
+      { text: " ", color: undefined },
+    );
+    actionX = x1 + 2;
+  }
+  const buttonText = actionSegments.map((s) => s.text).join("");
+  const edgePad = Math.max(0, viewWidth(snap.cols) - 1 - w2(buttonText));
+  rows.push({
+    text: `│ ${buttonText}${" ".repeat(edgePad)}│`,
+    segments: [
+      { text: "│ ", color: C.borderDim },
+      ...actionSegments,
+      { text: `${" ".repeat(edgePad)}│`, color: C.borderDim },
+    ],
+  });
+  rows.push(boxBottom(snap.cols));
+
+  rows.push({ text: t("settings.hint"), color: C.gray });
   return { rows, regions };
 }
 
@@ -1152,5 +1296,7 @@ export function buildView(view: ViewName, snap: ViewSnapshot, actions: ViewActio
       return feesView(snap, actions);
     case "logs":
       return logsView(snap);
+    case "settings":
+      return settingsView(snap, actions);
   }
 }

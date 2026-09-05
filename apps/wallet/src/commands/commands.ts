@@ -3,6 +3,7 @@ import { formatNumber, padCJK, truncateMiddle, txConfirmText, txMaturityLine, tx
 import { COIN_TICKER, MINING_MATURITY_CONFIRMATIONS } from "../utils/constants";
 import { FEE_TIER_NAMES, isFeeTierName, type FeeTierName } from "../core/fee";
 import { promptSecret } from "../keys/vaultLegacy";
+import { parseCount, parseSkip } from "../core/paging";
 import type { FeeTiers } from "../api/types";
 import type { AskOption, Command, CommandContext } from "./registry";
 import { currentLocale, getLang, LANG_BUTTON_LABEL, LANG_ORDER, saveLang, setLang, t, type Lang } from "../i18n";
@@ -10,6 +11,9 @@ import { currentLocale, getLang, LANG_BUTTON_LABEL, LANG_ORDER, saveLang, setLan
 
 
 const AMOUNT_LIKE = /^\d*\.?\d+$/;
+
+/** Maximum password confirmation attempts for sensitive commands. */
+export const PASSWORD_RETRY_LIMIT = 3;
 
 function fmtTime(sec: number): string {
   return new Date(sec * 1000).toLocaleString(currentLocale(), { hour12: false });
@@ -19,8 +23,39 @@ function fmtTime(sec: number): string {
 async function resolvePassword(ctx: CommandContext): Promise<string | null> {
   if (ctx.password !== undefined) return ctx.password;
   if (process.env.EDX_WALLET_PASSWORD) return process.env.EDX_WALLET_PASSWORD;
+  if (ctx.askSecret) return ctx.askSecret(t("dialog.walletPassword"));
   if (ctx.interactive) return promptSecret(t("dialog.walletPassword"));
   return null;
+}
+
+/**
+ * Re-verify the wallet password for a sensitive operation.
+ * - Wallets without a vault skip verification entirely.
+ * - Every attempt prompts interactively (askSecret); an empty answer cancels.
+ * - Only "wrong password" failures retry, up to PASSWORD_RETRY_LIMIT; any
+ *   other error (insufficient funds, invalid address, ...) aborts immediately.
+ * - The password is never taken from ctx.password or the environment: each
+ *   sensitive invocation requires a fresh interactive confirmation.
+ */
+export async function withPasswordConfirm<T>(ctx: CommandContext, onVerify: (password: string) => T | Promise<T>, description: string): Promise<T | null> {
+  if (!ctx.core.requirePassword()) return onVerify("");
+  if (!ctx.askSecret && !ctx.interactive) {
+    throw new Error(`${description} requires interactive wallet-password confirmation (run this command inside the console)`);
+  }
+  const ask = ctx.askSecret ?? ((prompt: string) => promptSecret(prompt));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < PASSWORD_RETRY_LIMIT; attempt += 1) {
+    const password = await ask(t("dialog.walletPassword"));
+    if (password === null || password === "") return null;
+    try {
+      return await onVerify(password);
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof Error) || !error.message.includes("Wrong wallet password")) throw error;
+      ctx.log.warn(`${description}: wrong password (attempt ${attempt + 1}/${PASSWORD_RETRY_LIMIT})`);
+    }
+  }
+  throw lastError ?? new Error(`${description}: password confirmation failed`);
 }
 
 export function builtinCommands(): Command[] {
@@ -83,22 +118,40 @@ export function builtinCommands(): Command[] {
       name: "listaddresses",
       aliases: ["addresses", "getaddresses"],
       summary: () => t("cmd.summary.listaddresses"),
-      usage: "listaddresses",
-      run: (_args, ctx) => ctx.core.walletAddresses().join("\n"),
+      usage: "listaddresses [count] [skip]",
+      run: (_args, ctx) => {
+        const all = ctx.core.walletAddresses();
+        const count = _args[0] !== undefined ? parseCount(_args[0]) : 100;
+        const skip = _args[1] !== undefined ? parseSkip(_args[1]) : 0;
+        const page = all.slice(skip, skip + count);
+        if (page.length === 0) return t("history.empty");
+        const tail =
+          skip + page.length < all.length
+            ? `${t("cmd.listPaging", { start: skip + 1, end: skip + page.length, total: all.length })}`
+            : "";
+        return [...page, ...(tail ? [tail] : [])].join("\n");
+      },
     },
     {
       name: "listunspent",
       aliases: ["utxos"],
       summary: () => t("cmd.summary.listunspent"),
-      usage: "listunspent [minconf] [maxconf]",
+      usage: "listunspent [minconf] [maxconf] [count] [skip]",
       run: async (args, ctx) => {
         const minconf = args[0] !== undefined && /^\d+$/.test(args[0]) ? Number(args[0]) : 0;
         const maxconf = args[1] !== undefined && /^\d+$/.test(args[1]) ? Number(args[1]) : 9999999;
-        const utxos = await ctx.core.listUnspent(minconf, maxconf);
-        if (utxos.length === 0) return t("history.empty");
-        return utxos
-          .map((u) => `${truncateMiddle(u.txid, 16)}:${u.index}  ${trimEDX(u.amount)} ${COIN_TICKER} (${u.address})`)
-          .join("\n");
+        const count = args[2] !== undefined ? parseCount(args[2]) : 100;
+        const skip = args[3] !== undefined ? parseSkip(args[3]) : 0;
+        const all = await ctx.core.listUnspent(minconf, maxconf);
+        if (all.length === 0) return t("history.empty");
+        const utxos = all.slice(skip, skip + count);
+        const lines = utxos
+          .map((u) => `${truncateMiddle(u.txid, 16)}:${u.index}  ${trimEDX(u.amount)} ${COIN_TICKER} (${u.address})`);
+        const tail =
+          skip + utxos.length < all.length
+            ? `${t("cmd.listPaging", { start: skip + 1, end: skip + utxos.length, total: all.length })}`
+            : "";
+        return [...lines, ...(tail ? [tail] : [])].join("\n");
       },
     },
     {
@@ -242,14 +295,38 @@ export function builtinCommands(): Command[] {
       summary: () => t("cmd.summary.mnemonic"),
       usage: () => t("cmd.usage.mnemonic"),
       run: async (args, ctx) => {
-        let password = args[0];
-        if (ctx.core.requirePassword() && password === undefined) {
-          const resolved = await resolvePassword(ctx);
-          if (resolved === null) return "Usage: mnemonic <password> (requires wallet password verification)";
-          password = resolved;
+        if (!ctx.core.requirePassword()) {
+          const mnemonic = ctx.core.getMnemonic("");
+          return `${t("cmd.balance.address", { address: ctx.core.getAddress() })}\n${t("cmd.mnemonic.title")}\n  ${mnemonic}`;
         }
-        const mnemonic = ctx.core.getMnemonic(password ?? "");
-        return `${t("cmd.balance.address", { address: ctx.core.getAddress() })}\n${t("cmd.mnemonic.title")}\n  ${mnemonic}`;
+        const explicit = args[0];
+        if (explicit !== undefined) {
+          const mnemonic = ctx.core.getMnemonic(explicit);
+          return `${t("cmd.balance.address", { address: ctx.core.getAddress() })}\n${t("cmd.mnemonic.title")}\n  ${mnemonic}`;
+        }
+        if (ctx.password !== undefined) {
+          const mnemonic = ctx.core.getMnemonic(ctx.password);
+          return `${t("cmd.balance.address", { address: ctx.core.getAddress() })}\n${t("cmd.mnemonic.title")}\n  ${mnemonic}`;
+        }
+        const result = await withPasswordConfirm(ctx, (password) => ctx.core.getMnemonic(password), "mnemonic export");
+        if (result === null) return t("cmd.send.cancelled");
+        return `${t("cmd.balance.address", { address: ctx.core.getAddress() })}\n${t("cmd.mnemonic.title")}\n  ${result}`;
+      },
+    },
+    {
+      name: "dumpprivkey",
+      aliases: ["privkey"],
+      summary: () => t("cmd.summary.dumpprivkey"),
+      usage: "dumpprivkey <address>",
+      run: async (args, ctx) => {
+        const address = args[0]?.trim();
+        if (!address) return t("cmd.usage", { usage: "dumpprivkey <address>" });
+        if (!ctx.core.requirePassword()) return ctx.core.dumpPrivKey(address, "");
+        if (args[1] !== undefined) return ctx.core.dumpPrivKey(address, args[1]);
+        if (ctx.password !== undefined) return ctx.core.dumpPrivKey(address, ctx.password);
+        const result = await withPasswordConfirm(ctx, (password) => ctx.core.dumpPrivKey(address, password), `private key export for ${truncateMiddle(address, 16)}`);
+        if (result === null) return t("cmd.send.cancelled");
+        return result;
       },
     },
     {
@@ -258,8 +335,9 @@ export function builtinCommands(): Command[] {
       summary: () => t("cmd.summary.history"),
       usage: () => t("cmd.usage.history"),
       run: async (args, ctx) => {
-        const limit = args[0] ? Number.parseInt(args[0], 10) : 20;
-        const txs = await ctx.core.listTransactions(Number.isFinite(limit) ? limit : 20);
+        const count = args[0] !== undefined ? parseCount(args[0], 20) : 20;
+        const skip = args[1] !== undefined ? parseSkip(args[1]) : 0;
+        const txs = await ctx.core.listTransactions(count, skip);
         if (txs.length === 0) return t("history.empty");
         const header = padCJK(t("history.colTime"), 20) + padCJK(t("history.colType"), 4) + padCJK(t("history.colAmount"), 12) + padCJK(t("history.colFee"), 10) + padCJK(t("history.colStatus"), 7) + padCJK(t("history.colConfirm"), 4) + "txid";
         const lines = txs.map((tx) => {
@@ -277,7 +355,8 @@ export function builtinCommands(): Command[] {
         const hint = txs.some((tx) => tx.matureAtHeight !== null)
           ? t("history.maturityHint", { n: MINING_MATURITY_CONFIRMATIONS })
           : null;
-        return [header, ...lines, ...(hint ? [hint] : [])].join("\n");
+        const more = txs.length === count ? t("cmd.historyMore", { count, skip: skip + count }) : null;
+        return [header, ...lines, ...(hint ? [hint] : []), ...(more ? [more] : [])].join("\n");
       },
     },
     {
