@@ -5,6 +5,7 @@ import type { Logger } from "../utils/log";
 import type { WalletConfig } from "../config/config";
 import { decodeBlockHex, submitBlock } from "../core/rpcCore";
 import { DEFAULT_HISTORY_COUNT, parseCount, parseSkip } from "../core/paging";
+import { VERSION } from "../updater/versionCheck";
 
 const RPC_PARSE_ERROR = -32700;
 const RPC_INVALID_REQUEST = -32600;
@@ -554,7 +555,7 @@ export class WalletRpcServer {
         const count = this.core.getConnectionCount();
         return {
           version: 1,
-          subversion: "/EDX:1.0/",
+          subversion: `/EDX:${VERSION}/`,
           protocolversion: 70016,
           connections: count,
           relayfee: "0.00001000",

@@ -36,6 +36,7 @@ import type { WalletCore } from "../core/walletCore";
 import type { Logger, LogLine } from "../utils/log";
 import type { AskFn, AskOption, CommandRegistry } from "../commands/registry";
 import type { WalletConfig } from "../config/config";
+import { VERSION } from "../updater/versionCheck";
 import type {
   ChainInfoView,
 
@@ -943,7 +944,7 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
       peersText,
       qr,
       copyMsg,
-      version: "1.0.0",
+      version: VERSION,
       datadir: config.datadir,
     },
     {

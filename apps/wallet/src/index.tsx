@@ -31,8 +31,7 @@ import { warnAndPromptTuiEnv } from "./tui/envCheck";
 import { applyStoredLang, currentLocale, t } from "./i18n";
 import { startWalletRpc } from "./rpc/lifecycle";
 import { runConsoleWithReadline } from "./cli/consoleSession";
-
-const VERSION = "1.0.0";
+import { VERSION } from "./updater/versionCheck";
 
 function printHelp(): void {
   console.log(`EdgeX Network Wallet (EDX) v${VERSION}
@@ -48,7 +47,16 @@ Usage:
 Global options:
   -conf=FILE       Configuration path (default <datadir>/dexcoin.conf)
   -datadir=DIR     Data directory (default ./EDX_DATA)
+  -password=SECRET Wallet password for this process only (overrides
+                   EDX_WALLET_PASSWORD; never stored, never logged, and not
+                   parsed from dexcoin.conf)
   --help / --version
+
+Environment:
+  EDX_WALLET_PASSWORD   Wallet password for unattended startup (daemon /
+                        one-shot). It only decrypts wallet.vault at load time;
+                        it is not a substitute for interactive confirmation on
+                        sensitive commands, which always re-prompt.
 
 Commands:
   help | info | balance | receive | history [count] [skip] | tx <txid>
@@ -133,9 +141,13 @@ function runOnboarding(config: WalletConfig, log: Logger): Promise<{ key: Wallet
   });
 }
 
-async function loadExistingWallet(config: WalletConfig, log: Logger): Promise<{ key: WalletKey; password: string }> {
+async function loadExistingWallet(
+  config: WalletConfig,
+  log: Logger,
+  opts: { password?: string } = {},
+): Promise<{ key: WalletKey; password: string }> {
   try {
-    return await loadWalletWithRetry(config.datadir);
+    return await loadWalletWithRetry(config.datadir, { password: opts.password });
   } catch (error) {
     const message = (error as Error).message;
     log.error(`Wallet load failed: ${message}`);
@@ -149,15 +161,25 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
   mkdirSync(config.datadir, { recursive: true });
   initGlobalData();
   applyStoredLang(config.datadir);
-  const log = new Logger({ console: !tui, file: path.join(config.datadir, "dexcoin.log") });
+  // The TUI and the interactive console keep their log lines off the shared
+  // console output (the console session prints its own transcript and redraws
+  // the prompt around in-band log lines). The daemon logs straight to the
+  // console only when it runs in a foreground terminal; when its stdout is a
+  // pipe (service manager / redirection) the console stays clean and lines go
+  // to dexcoin.log only.
+  const interactiveTerminal = Boolean(process.stdout.isTTY);
+  const log = new Logger({
+    console: !tui && interactiveTerminal,
+    file: path.join(config.datadir, "dexcoin.log"),
+  });
   warnings.forEach((warning) => log.warn(warning));
-  if (tui && process.stdout.isTTY) await warnAndPromptTuiEnv(log);
+  if (tui && interactiveTerminal) await warnAndPromptTuiEnv(log);
 
   let key: WalletKey;
   let password: string | undefined;
   let created = false;
   if (!hasWalletFile(config.datadir)) {
-    if (!tui || !process.stdout.isTTY) {
+    if (!tui || !interactiveTerminal) {
       console.error(`Wallet not initialized: ${vaultFilePath(config.datadir)} missing`);
       process.exit(1);
     }
@@ -165,7 +187,7 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
     key = result.key;
     created = result.created;
   } else {
-    const loaded = await loadExistingWallet(config, log);
+    const loaded = await loadExistingWallet(config, log, { password: paths.password });
     key = loaded.key;
     password = loaded.password;
   }
@@ -198,7 +220,7 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
   process.on("SIGINT", exit);
   process.on("SIGTERM", exit);
 
-  if (!tui || !process.stdout.isTTY) {
+  if (!tui || !interactiveTerminal) {
     log.info(t("log.daemonRunning", { summary: serviceSummary(config), nodes: joinNodes(config.addnodes) }));
     return;
   }
@@ -224,7 +246,7 @@ async function startConsole(paths: CliPaths): Promise<void> {
     console.error(`Wallet not initialized: ${vaultFilePath(config.datadir)} missing; run init first`);
     process.exit(1);
   }
-  const loaded = await loadExistingWallet(config, log);
+  const loaded = await loadExistingWallet(config, log, { password: paths.password });
   const { core, registry, game } = buildServices(config, loaded.key, log, loaded.password);
   const rpc = startWalletRpc(config, core, log);
   try {
@@ -315,7 +337,7 @@ async function runOneShot(command: string, args: string[], paths: CliPaths): Pro
     console.error(`Wallet not initialized: ${vaultFilePath(config.datadir)} missing; run init first`);
     process.exit(1);
   }
-  const loaded = await loadExistingWallet(config, log);
+  const loaded = await loadExistingWallet(config, log, { password: paths.password });
   const { core, registry } = buildServices(config, loaded.key, log, loaded.password);
   await core.start().catch(() => undefined);
   try {

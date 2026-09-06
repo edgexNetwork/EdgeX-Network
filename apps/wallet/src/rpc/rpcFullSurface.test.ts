@@ -4,6 +4,7 @@ import type { ConnectionManager } from "../core/connection";
 import { WalletRpcServer } from "./server";
 import { GENESIS_BLOCK } from "@edgex/core";
 import type { Block } from "@edgex/core";
+import { VERSION } from "../updater/versionCheck";
 
 /**
  * Full RPC surface tests: every method of the decentralized wallet RPC server
@@ -420,7 +421,7 @@ describe("wallet RPC full surface", () => {
   test("serves network control methods", async () => {
     const { server } = makeServer();
     const network = await rpcCall(server, "getnetworkinfo");
-    expect((network.result as Record<string, unknown>).subversion).toBe("/EDX:1.0/");
+    expect((network.result as Record<string, unknown>).subversion).toBe(`/EDX:${VERSION}/`);
     expect((await rpcCall(server, "addnode", ["http://127.0.0.1:28332", "add"])).result).toBeNull();
     expect((await rpcCall(server, "addnode", ["http://127.0.0.1:28332", "remove"])).result).toBeNull();
     expect((await rpcCall(server, "addnode", ["http://127.0.0.1:28332", "bad"])).error).toBeDefined();

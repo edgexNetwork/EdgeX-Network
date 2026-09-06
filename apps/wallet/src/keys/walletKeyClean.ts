@@ -137,15 +137,24 @@ export interface LoadWalletRetryOptions {
   interactive?: boolean;
 
   getPassword?: (prompt: string) => Promise<string>;
+
+  /**
+   * Explicit wallet password supplied by the caller (e.g. parsed from the
+   * -password= CLI flag). When provided it takes precedence over the
+   * EDX_WALLET_PASSWORD environment variable and is attempted exactly once,
+   * never falling back to an interactive stdin prompt.
+   */
+  password?: string;
 }
 
-
-
-
-
-
-
-
+/**
+ * Load the wallet key, resolving the password in this order:
+ *   1. an explicit password passed by the caller (opts.password);
+ *   2. the EDX_WALLET_PASSWORD environment variable;
+ *   3. interactive prompts (only when stdin/stdout are TTYs).
+ * Sources 1 and 2 are single-attempt (a wrong password throws PasswordError);
+ * interactive loads retry up to maxAttempts (5 on a TTY, once otherwise).
+ */
 export async function loadWalletWithRetry(
   datadir: string,
   opts: LoadWalletRetryOptions = {},
@@ -153,10 +162,22 @@ export async function loadWalletWithRetry(
   const getPassword = opts.getPassword ?? promptSecret;
   const interactive = opts.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
   const envPassword = process.env.EDX_WALLET_PASSWORD;
-  if (envPassword) {
-    return { key: loadWalletKey(datadir, envPassword), password: envPassword };
+  const explicitPassword = opts.password ?? envPassword;
+  if (explicitPassword !== undefined && explicitPassword !== "") {
+    try {
+      return { key: loadWalletKey(datadir, explicitPassword), password: explicitPassword };
+    } catch (error) {
+      throw new PasswordError((error as Error).message);
+    }
   }
-  const maxAttempts = interactive ? (opts.maxAttempts ?? MAX_PASSWORD_ATTEMPTS) : 1;
+  if (!interactive) {
+    // Unattended (daemon / piped) start without any supplied password: fail
+    // fast with a clear message instead of blocking on a stdin prompt.
+    throw new PasswordError(
+      "Wallet password is required for unattended startup (pass -password=SECRET or set EDX_WALLET_PASSWORD)",
+    );
+  }
+  const maxAttempts = opts.maxAttempts ?? MAX_PASSWORD_ATTEMPTS;
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const prompt =

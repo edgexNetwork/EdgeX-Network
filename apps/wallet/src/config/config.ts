@@ -69,6 +69,11 @@ export interface CliPaths {
   conf?: string;
   datadir?: string;
 
+  /** Wallet password supplied on the command line for this process only
+   *  (-password=SECRET). It is never written to dexcoin.conf, never logged and
+   *  never stored; it only decrypts wallet.vault at load time. */
+  password?: string;
+
   dev?: boolean;
 }
 
@@ -88,6 +93,7 @@ export function parseCliPaths(argv: string[]): { paths: CliPaths; rest: string[]
     }
     if (arg.startsWith("-conf=")) paths.conf = arg.slice(6);
     else if (arg.startsWith("-datadir=")) paths.datadir = arg.slice(9);
+    else if (arg.startsWith("-password=")) paths.password = arg.slice(10);
     else rest.push(arg);
   }
   return { paths, rest };

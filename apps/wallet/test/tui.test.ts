@@ -20,6 +20,7 @@ import { hitLangButton, hitModeButton, hitTabRow } from "../src/tui/mouseHit";
 import { onboardingFocusOrder, stepOnboardFocus } from "../src/tui/Onboarding";
 import { strWidth } from "../src/utils/display";
 import { initGlobalData } from "../src/core/globalData";
+import { VERSION } from "../src/updater/versionCheck";
 
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "edgex-tui-"));
 initGlobalData(temporaryDirectory);
@@ -116,7 +117,7 @@ describe("legacy TUI structure", () => {
     peersText: "",
     qr: ["###"],
     copyMsg: null,
-    version: "1.0.0",
+    version: VERSION,
     datadir: temporaryDirectory,
   };
   const actions = {
