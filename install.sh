@@ -29,15 +29,18 @@ DOWNLOAD_URL="https://github.com/edgexNetwork/EdgeX-Network/releases/latest/down
 INSTALL_DIR="$HOME/.dexcoin/bin"
 
 mkdir -p "$INSTALL_DIR"
-# Remove stale binaries from previous installs
+# Only remove old program binaries; user data (EDX_DATA/, dexcoin.conf, *.vault, chain.db) is preserved
 rm -f "$INSTALL_DIR/dexcoin" "$INSTALL_DIR"/dexcoin-wallet-"$OS"-*
 
-# 3. Download and extract in one step
-echo "Downloading and extracting $TARGET_ARCHIVE..."
+# 3. Download and extract to a temp dir, then move just the program binary into place
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+echo "Downloading $TARGET_ARCHIVE..."
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$DOWNLOAD_URL" | tar -xz -C "$INSTALL_DIR"
+  curl -fsSL "$DOWNLOAD_URL" | tar -xz -C "$TMP_DIR"
 elif command -v wget >/dev/null 2>&1; then
-  wget -qO- "$DOWNLOAD_URL" | tar -xz -C "$INSTALL_DIR"
+  wget -qO- "$DOWNLOAD_URL" | tar -xz -C "$TMP_DIR"
 else
   echo "Error: curl or wget is required."
   exit 1
@@ -45,7 +48,7 @@ fi
 
 # 4. Rename platform binary (e.g. dexcoin-wallet-linux-x64) to "dexcoin"
 EXTRACTED_FILE=""
-for f in "$INSTALL_DIR"/dexcoin-wallet-"$OS"*; do
+for f in "$TMP_DIR"/dexcoin-wallet-"$OS"*; do
   if [ -f "$f" ]; then
     EXTRACTED_FILE="$f"
     break

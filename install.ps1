@@ -28,9 +28,10 @@ if ($Process) {
     $Process | Stop-Process -Force
 }
 
-# 4. Create install dir and remove stale files
+# 4. Create install dir and remove stale program binaries (preserve EDX_DATA, dexcoin.conf, wallet files)
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-Get-ChildItem -Path $InstallDir -Force | Remove-Item -Recurse -Force
+Get-ChildItem -Path $InstallDir -Filter "dexcoin*.exe" -Force -ErrorAction SilentlyContinue |
+    Remove-Item -Force
 
 # 5. Download archive
 Write-Host "Downloading $TargetArchive..." -ForegroundColor Cyan
