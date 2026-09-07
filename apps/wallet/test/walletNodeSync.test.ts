@@ -85,11 +85,9 @@ describe("wallet chain download over the peer link", () => {
       () => ({ height: service.chain.height, bestHash: service.chain.bestBlockHash }),
       () => undefined,
       (block) => {
-        try {
-          service.acceptBlock(block);
-        } catch {
-          // Invalid peer blocks are rejected without disconnecting the peer.
-        }
+        // Invalid peer blocks throw out of consensus; the peer layer counts
+        // the rejection and keeps the connection healthy.
+        service.acceptBlock(block);
       },
     );
     network.setPeerDataSource({

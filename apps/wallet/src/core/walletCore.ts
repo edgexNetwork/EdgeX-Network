@@ -41,6 +41,20 @@ import {
 } from "../keys/addressIndex";
 
 const POLL_INTERVAL_MS = 15_000;
+/** Blocks requested per page during local chain download. */
+const SYNC_PAGE_SIZE = 200;
+/**
+ * Consecutive chain-data failures tolerated before the wallet flags its local
+ * chain as corrupt ("error" sync state). A page boundary can drift when the
+ * chain grows while a page is in flight; such transient races must not count
+ * as data corruption, so only repeated failures without any successful append
+ * in between escalate to the error state.
+ */
+const MAX_ANCHOR_FAILURES = 5;
+/** Initial pause before re-anchoring after a page drift (doubles each failure). */
+const ANCHOR_BACKOFF_MS = 1_000;
+/** Upper bound of the re-anchoring backoff. */
+const ANCHOR_BACKOFF_MAX_MS = 8_000;
 export interface PaymentInput {
   address: string;
   amount: string;
@@ -68,6 +82,12 @@ export class WalletCore {
   private feeFetchedAt = 0;
   private transactions: TxView[] = [];
   private balanceValue: bigint | null = null;
+  /** Consecutive chain-data failures since the last successful block append. */
+  private syncAnchorFailures = 0;
+  /** Current re-anchor backoff between chain-data failure retries. */
+  private syncBackoffMs = ANCHOR_BACKOFF_MS;
+  /** True while a local chain download is running (single-flight guard). */
+  private syncInFlight = false;
 
   constructor(
     readonly config: WalletConfig,
@@ -184,6 +204,13 @@ export class WalletCore {
       connectedNodes: this.conn.connectedCount,
     });
     const localTip = this.database.localTip();
+    if (this.chain.syncStatus === "error") {
+      // A data error latches the error state until the user rebuilds with
+      // resync; the wallet keeps polling the node for the chain head but no
+      // longer tries to append onto a corrupt local chain.
+      this.bus.emit("chain:update", this.chain.toView());
+      return this.chain.toView();
+    }
     this.chain.setSync({
       localHeight: Math.max(0, localTip.height),
       syncStatus: localTip.height >= height ? "synced" : this.conn.connectedCount > 0 ? "syncing" : "none",
@@ -1040,36 +1067,86 @@ export class WalletCore {
   async resync(): Promise<void> {
     this.log.info("Rebuilding local wallet chain database");
     this.database.rebuild();
+    this.syncAnchorFailures = 0;
+    this.syncBackoffMs = ANCHOR_BACKOFF_MS;
     this.chain.setSync({ localHeight: 0, syncStatus: "syncing", syncError: null, lastBlockTime: null });
     await this.refreshChain();
   }
 
+  /**
+   * Download the missing tail of the local chain database from the connected
+   * node. Pages are requested in ascending height order; each page is verified
+   * to continue exactly where the previous one ended and appended locally.
+   *
+   * Failure handling mirrors the node-facing sync policy:
+   * - A transport failure (unreachable node, HTTP error, empty page) is not a
+   *   data error: the wallet stays in "syncing" and the next poll retries.
+   * - A chain-data error (page does not continue the chain, prevHash mismatch,
+   *   genesis mismatch) is usually a transient race when the chain grew while
+   *   the page was in flight. Only MAX_ANCHOR_FAILURES consecutive data errors
+   *   with no successful append in between flag the local database as corrupt
+   *   and latch the "error" sync state (recoverable through resync()).
+   */
   private async synchronizeLocalDatabase(networkHeight: number, expectedGenesisHash: string): Promise<void> {
+    if (this.syncInFlight) return;
+    if (this.chain.syncStatus === "error") return;
+    if (this.stopped) return;
+    this.syncInFlight = true;
     try {
       let localHeight = this.database.localHeight();
       if (localHeight > networkHeight) {
+        this.log.warn(`Chain rollback detected: local ${localHeight}, network ${networkHeight}; truncating`);
         this.database.truncate(networkHeight);
         localHeight = this.database.localHeight();
       }
       while (localHeight < networkHeight) {
+        if (this.stopped) return;
         const startHeight = Math.max(0, localHeight + 1);
-        const response = await this.conn.requestTransport("GET", `/chain/blocks?start=${startHeight}&limit=200`);
-        if (response.status < 200 || response.status >= 300) throw new Error(`node returned HTTP ${response.status}`);
+        const response = await this.conn
+          .requestTransport("GET", `/chain/blocks?start=${startHeight}&limit=${SYNC_PAGE_SIZE}`)
+          .catch(() => null);
+        if (!response || response.status < 200 || response.status >= 300) {
+          // The node is unreachable or refused the page; stay in "syncing"
+          // and let the next poll resume the download.
+          return;
+        }
         const page = (response.data as { items?: unknown[] }).items ?? [];
         const first = page[0] as { header?: { height?: number } } | undefined;
-        if (page.length === 0 || first?.header?.height !== startHeight) {
-          throw new ChainDataError(`node did not return block ${startHeight}`);
+        try {
+          if (page.length === 0 || first?.header?.height !== startHeight) {
+            throw new ChainDataError(`node did not return block ${startHeight}`);
+          }
+          if (startHeight === 0 && expectedGenesisHash && (page[0] as { hash?: string }).hash !== expectedGenesisHash) {
+            throw new ChainDataError("local wallet database genesis does not match the selected node");
+          }
+          this.database.appendBlocks(page as Parameters<ChainStore["appendBlocks"]>[0]);
+          // A page landed: the drift was transient, reset the failure counter.
+          this.syncAnchorFailures = 0;
+          this.syncBackoffMs = ANCHOR_BACKOFF_MS;
+          localHeight = this.database.localHeight();
+          this.chain.setSync({
+            localHeight: Math.max(0, localHeight),
+            lastBlockTime: this.database.localTip().ts || null,
+          });
+          this.bus.emit("chain:update", this.chain.toView());
+        } catch (error) {
+          if (!(error instanceof ChainDataError)) throw error;
+          // A data error can be a boundary drift caused by the chain advancing
+          // mid-download. Re-anchor with a growing backoff a bounded number of
+          // times; only when the data error keeps recurring without any
+          // successful append is the local chain treated as corrupt.
+          this.syncAnchorFailures += 1;
+          if (this.syncAnchorFailures >= MAX_ANCHOR_FAILURES) {
+            this.failLocalChainSync(error.message);
+            return;
+          }
+          this.log.warn(
+            `Chain sync page drift: ${error.message}; re-anchoring (attempt ${this.syncAnchorFailures}/${MAX_ANCHOR_FAILURES})`,
+          );
+          await chainSyncHooks.sleep(this.syncBackoffMs);
+          this.syncBackoffMs = Math.min(this.syncBackoffMs * 2, ANCHOR_BACKOFF_MAX_MS);
+          continue;
         }
-        if (startHeight === 0 && expectedGenesisHash && (page[0] as { hash?: string }).hash !== expectedGenesisHash) {
-          throw new ChainDataError("local wallet database genesis does not match the selected node");
-        }
-        this.database.appendBlocks(page as Parameters<ChainStore["appendBlocks"]>[0]);
-        localHeight = this.database.localHeight();
-        this.chain.setSync({
-          localHeight: Math.max(0, localHeight),
-          lastBlockTime: this.database.localTip().ts || null,
-        });
-        this.bus.emit("chain:update", this.chain.toView());
       }
       this.chain.setSync({
         localHeight: Math.max(0, this.database.localHeight()),
@@ -1077,15 +1154,28 @@ export class WalletCore {
         syncError: null,
         lastBlockTime: this.database.localTip().ts || null,
       });
-    } catch (error) {
-      const reason = error instanceof ChainDataError ? error.message : (error as Error).message;
-      this.chain.setSync({
-        localHeight: Math.max(0, this.database.localHeight()),
-        syncStatus: "error",
-        syncError: reason,
-      });
-      throw error;
+      this.syncAnchorFailures = 0;
+      this.syncBackoffMs = ANCHOR_BACKOFF_MS;
+    } finally {
+      this.syncInFlight = false;
     }
+  }
+
+  /**
+   * A repeated chain-data error latches the wallet into the "error" sync
+   * state: the local database is considered corrupt, the wallet stops syncing
+   * and surfaces the reason (the UI tells the user to run resync to rebuild).
+   */
+  private failLocalChainSync(reason: string): void {
+    const message = reason.startsWith("Blockchain data error:") ? reason : `Blockchain data error: ${reason}`;
+    this.log.error(message);
+    this.chain.setSync({
+      localHeight: Math.max(0, this.database.localHeight()),
+      syncStatus: "error",
+      syncError: message,
+      lastBlockTime: this.database.localTip().ts || null,
+    });
+    this.bus.emit("chain:update", this.chain.toView());
   }
 }
 
@@ -1125,3 +1215,8 @@ function decodeRawTransactionBody(hex: string): RawTransactionBody {
 function encodeRawTransactionHex(body: unknown): string {
   return Buffer.from(JSON.stringify(body), "utf8").toString("hex");
 }
+
+/** Internal sync hooks; tests swap the sleep implementation to avoid real backoff waits. */
+export const chainSyncHooks: { sleep: (ms: number) => Promise<void> } = {
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};

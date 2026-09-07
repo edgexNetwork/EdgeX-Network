@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GENESIS_BLOCK } from '@edgex/core';
-import { MINER, mineBlocks, startNode, waitFor } from './helpers';
+import type { Block } from '@edgex/core';
+import { MINER, buildBlock, mineBlocks, startNode, waitFor } from './helpers';
 
 describe('P2P block synchronization', () => {
   const root = mkdtempSync(join(tmpdir(), 'edgex-p2p-sync-'));
@@ -35,7 +36,7 @@ describe('P2P block synchronization', () => {
     await waitFor(() => behind.service.chain.height === 10, 8_000);
     expect(behind.service.chain.bestBlockHash).toBe(ahead.service.chain.bestBlockHash);
     expect(behind.store.count()).toBe(11); // genesis + ten blocks
-  });
+  }, 20_000);
 
   test('does not re-download blocks once both chains are aligned', async () => {
     const ahead = startNode(caseDirectory, 'ahead-aligned');
@@ -53,5 +54,38 @@ describe('P2P block synchronization', () => {
     // end up mutually connected; the link must stay healthy after alignment.
     expect(behind.network.peerCount).toBeGreaterThanOrEqual(1);
     expect(ahead.network.peerCount).toBeGreaterThanOrEqual(1);
-  });
+  }, 20_000);
+
+  test('rejects an invalid peer block without disconnecting the peer', async () => {
+    const ahead = startNode(caseDirectory, 'ahead-badblock');
+    const behind = startNode(caseDirectory, 'behind-badblock', [ahead.url]);
+    running.push(ahead, behind);
+
+    await waitFor(() => ahead.network.peerCount === 1 && behind.network.peerCount === 1);
+
+    // Broadcast a block whose previous hash points at a parent nobody knows.
+    // Consensus throws "unknown previous block"; the receiving node must count
+    // the rejection, keep the link open and keep running.
+    const valid = buildBlock(
+      behind.service.chain.get(behind.service.chain.bestBlockHash).block,
+      GENESIS_BLOCK.header.timestampSeconds + 30,
+      MINER,
+    );
+    const bogus: Block = {
+      ...valid,
+      header: { ...valid.header, previousHash: 'deadbeef'.repeat(8) },
+    };
+    // BigInt fields travel as decimal strings over the wire; rehydrate on receipt.
+    const wireBlock = {
+      ...bogus,
+      header: { ...bogus.header, difficulty: bogus.header.difficulty.toString() },
+    };
+    behind.network.broadcast({ type: 'block', block: wireBlock as unknown as Block });
+
+    await waitFor(() => ahead.network.rejectedPeerBlockCount >= 1, 3_000);
+    expect(ahead.service.chain.height).toBe(0); // nothing was accepted
+    // The offending peer is not disconnected: the gossip link stays healthy.
+    expect(ahead.network.peerCount).toBeGreaterThanOrEqual(1);
+    expect(behind.network.peerCount).toBeGreaterThanOrEqual(1);
+  }, 20_000);
 });

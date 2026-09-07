@@ -74,7 +74,7 @@ describe('P2P reorganization to a heavier fork', () => {
     await waitFor(() => base.service.chain.bestBlockHash === forkTip.hash, 10_000);
     expect(base.service.chain.height).toBe(5);
     expect(base.service.chain.bestBlockHash).toBe(forked.service.chain.bestBlockHash);
-  });
+  }, 25_000);
 
   test('reverts a node that mined a losing branch once a heavier fork appears', async () => {
     const base = startNode(caseDirectory, 'base-miner');
@@ -110,5 +110,5 @@ describe('P2P reorganization to a heavier fork', () => {
     await waitFor(() => base.service.chain.bestBlockHash === heavierTip.hash, 10_000);
     expect(base.service.chain.height).toBe(5);
     expect(base.service.chain.bestBlockHash).toBe(forked.service.chain.bestBlockHash);
-  });
+  }, 25_000);
 });

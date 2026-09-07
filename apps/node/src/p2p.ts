@@ -111,6 +111,7 @@ export class P2PNetwork {
   private syncRunning = false;
   private readonly lastSyncAt = new Map<SocketLike, number>();
   private fetchedBlocks = 0;
+  private rejectedBlocks = 0;
   private requestCounter = 0;
 
   /** Install the loopback-equivalent public API handler used by wallet peers. */
@@ -140,6 +141,15 @@ export class P2PNetwork {
   /** @internal test probe: total blocks received through block-sync requests. */
   get blocksFetchedCount(): number {
     return this.fetchedBlocks;
+  }
+
+  /**
+   * @internal test probe: how many blocks handed to the accept callback were
+   * rejected by consensus (the callback threw). A node must keep serving and
+   * stay connected when a peer feeds it invalid blocks.
+   */
+  get rejectedPeerBlockCount(): number {
+    return this.rejectedBlocks;
   }
 
   constructor(
@@ -429,7 +439,7 @@ export class P2PNetwork {
       return;
     }
     if (message.type === 'block') {
-      this.onBlock?.(message.block);
+      this.handlePeerBlock(message.block);
       return;
     }
     if (socket.readyState !== WebSocket.OPEN) return;
@@ -678,11 +688,26 @@ export class P2PNetwork {
         // A fork replacement starts below the local tip: those blocks were
         // accepted earlier but may belong to the currently losing branch, so
         // they are fed to consensus again to drive the reorganization.
-        this.onBlock?.(block);
+        this.handlePeerBlock(block);
       }
       if (!advanced) break;
     }
     this.fetchedBlocks += fetched;
+  }
+
+  /**
+   * Feed a peer-provided block to the consensus accept callback. Blocks that
+   * fail local validation are counted and dropped: a peer that sends garbage
+   * must not crash the node, stall a sync pass, or get the link torn down
+   * (the download simply stops at that block on the next pass).
+   */
+  private handlePeerBlock(block: Block): void {
+    try {
+      this.onBlock?.(block);
+    } catch (error) {
+      this.rejectedBlocks += 1;
+      console.warn(`Rejected block from peer (height ${block.header.height}): ${(error as Error).message}`);
+    }
   }
 
   /** Find the fork height where the local chain and the peer chain meet. */

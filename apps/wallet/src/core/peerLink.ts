@@ -13,6 +13,14 @@ export interface PeerLinkOptions {
   requestTimeoutMs?: number;
   onBlock?: (block: unknown) => void;
   onTransaction?: (transaction: SignedTransaction) => void;
+  /**
+   * Called when an established link drops on its own (remote close or network
+   * failure). A link closed intentionally through {@link PeerLink.close} does
+   * not trigger this callback, and a connection that never opened does not
+   * either. The connection manager uses this to reconnect promptly instead of
+   * waiting for the next periodic probe.
+   */
+  onClose?: (link: PeerLink) => void;
 }
 
 interface PendingRequest {
@@ -134,12 +142,19 @@ export class PeerLink {
       });
       socket.addEventListener("close", () => {
         this.connected = false;
-        if (this.socket === socket) this.socket = null;
+        // Only a socket that successfully became the active link counts as an
+        // established connection dropping on its own. Connections that never
+        // opened and links closed intentionally through close() (which clears
+        // this.socket first) are excluded so the manager is not told to
+        // reconnect a link it deliberately tore down.
+        const wasActive = this.socket === socket;
+        if (wasActive) this.socket = null;
         for (const pending of this.pending.values()) {
           clearTimeout(pending.timer);
           pending.reject(new Error(`P2P link disconnected: ${this.url}`));
         }
         this.pending.clear();
+        if (wasActive) this.options.onClose?.(this);
       });
     }).finally(() => {
       this.connecting = null;
@@ -149,8 +164,11 @@ export class PeerLink {
 
   close(): void {
     this.connected = false;
-    this.socket?.close();
+    // Close the socket first and detach it so its close event no longer counts
+    // as an unexpected drop (see the close listener above).
+    const socket = this.socket;
     this.socket = null;
+    socket?.close();
   }
 }
 

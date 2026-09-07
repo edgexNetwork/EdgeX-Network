@@ -33,11 +33,9 @@ async function main(): Promise<void> {
     () => ({ height: service.chain.height, bestHash: service.chain.bestBlockHash }),
     (transaction) => service.acceptTransaction(transaction),
     (block) => {
-      try {
-        service.acceptBlock(block);
-      } catch {
-        // Invalid peer blocks are rejected without disconnecting the peer.
-      }
+      // Invalid peer blocks throw out of consensus; the peer layer catches
+      // them, counts the rejection and keeps the connection healthy.
+      service.acceptBlock(block);
     },
     config.publicUrl,
   );
