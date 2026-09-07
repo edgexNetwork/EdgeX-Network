@@ -7,6 +7,8 @@ import { parseCount, parseSkip } from "../core/paging";
 import type { FeeTiers } from "../api/types";
 import type { AskOption, Command, CommandContext } from "./registry";
 import { currentLocale, getLang, LANG_BUTTON_LABEL, LANG_ORDER, saveLang, setLang, t, type Lang } from "../i18n";
+import { VERSION } from "../updater/versionCheck";
+import { applyUpdate } from "../updater/updateActions";
 
 
 
@@ -517,6 +519,24 @@ export function builtinCommands(): Command[] {
         setLang(next);
         if (ctx.datadir) saveLang(ctx.datadir, next);
         return t("cmd.lang.switched", { label: LANG_BUTTON_LABEL[next] });
+      },
+    },
+    {
+      name: "update",
+      aliases: ["upgrade"],
+      summary: () => t("cmd.summary.update"),
+      usage: "update",
+      run: async (_args, ctx) => {
+        // Development mode (-dev) reads the local version file; the production
+        // lookup stays offline unless a distribution build supplies a source.
+        const outcome = await applyUpdate({ dev: ctx.dev ?? false, cwd: process.cwd() });
+        if (outcome.installing) {
+          // The background installer replaces the binary while this process is
+          // alive; stop the wallet so the swap can complete cleanly.
+          ctx.log.warn(outcome.text);
+          ctx.core.requestStop();
+        }
+        return outcome.text;
       },
     },
   ];

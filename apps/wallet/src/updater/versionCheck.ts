@@ -16,7 +16,7 @@ import path from "node:path";
 /** The wallet's own version - the single source of truth for every surface
  *  that reports it (--version output, help header, RPC subversion, TUI
  *  settings page, console banner). */
-export const VERSION = "2.0.0";
+export const VERSION = "2.0.1";
 
 /** Remote release lookup is disabled by default: a stock build stays offline. */
 export const GITHUB_REPO = "edgexNetwork/EdgeX-Network";
@@ -26,6 +26,9 @@ export const RELEASES_URL = `https://github.com/${GITHUB_REPO}/releases/latest`;
 
 /** Local development version source file name (read from the working directory). */
 export const LOCAL_VERSION_FILE = "version";
+
+/** Endpoint that serves the official one-line installer (install.sh / install.ps1). */
+export const INSTALLER_URL = "https://install.edgexnetwork.org";
 
 export interface SemVer {
   major: number;

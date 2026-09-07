@@ -31,40 +31,13 @@ import { warnAndPromptTuiEnv } from "./tui/envCheck";
 import { applyStoredLang, currentLocale, t } from "./i18n";
 import { startWalletRpc } from "./rpc/lifecycle";
 import { runConsoleWithReadline } from "./cli/consoleSession";
+import { runCliOnboarding, OnboardCancelledError } from "./cli/onboardPrompt";
 import { VERSION } from "./updater/versionCheck";
+import { checkAndClassify, modeUpdateNotice, applyUpdate } from "./updater/updateActions";
+import { helpText } from "./cli/helpText";
 
 function printHelp(): void {
-  console.log(`EdgeX Network Wallet (EDX) v${VERSION}
-
-Usage:
-  edgex-wallet                       Start the full TUI (onboarding, top bar, dual modes)
-  edgex-wallet daemon                Start without UI (node polling remains active)
-  edgex-wallet console               Start the interactive line console (edx> )
-  edgex-wallet init                  Create a wallet interactively
-  edgex-wallet init --restore        Import a wallet interactively
-  edgex-wallet <command> [args...]   Run one command (balance, send, history, ...)
-
-Global options:
-  -conf=FILE       Configuration path (default <datadir>/dexcoin.conf)
-  -datadir=DIR     Data directory (default ./EDX_DATA)
-  -password=SECRET Wallet password for this process only (overrides
-                   EDX_WALLET_PASSWORD; never stored, never logged, and not
-                   parsed from dexcoin.conf)
-  --help / --version
-
-Environment:
-  EDX_WALLET_PASSWORD   Wallet password for unattended startup (daemon /
-                        one-shot). It only decrypts wallet.vault at load time;
-                        it is not a substitute for interactive confirmation on
-                        sensitive commands, which always re-prompt.
-
-Commands:
-  help | info | balance | receive | history [count] [skip] | tx <txid>
-  listaddresses [count] [skip] | listunspent [minconf] [maxconf] [count] [skip]
-  send <address>:<amount> [...] [fee] [slow|normal|fast] [password]
-  mnemonic [password] | dumpprivkey <address> [password]
-  peers | addnode <http://host:port> | fees | sync | lang [zh|en|ru|ja] | stop
-`);
+  console.log(helpText());
 }
 
 function parseInitArgs(args: string[]): { restore?: string; restoreRequested: boolean; force: boolean } {
@@ -156,6 +129,41 @@ async function loadExistingWallet(
   }
 }
 
+/**
+ * Plain-text first-run onboarding for the console and daemon entry points.
+ * - Interactive terminal: run the create/import walkthrough; a user cancel
+ *   exits cleanly (code 0), a hard failure logs and exits 1.
+ * - Non-interactive terminal: returns null so the caller keeps its
+ *   "run init first" error path.
+ */
+async function runCliOnboardingSafe(
+  config: WalletConfig,
+  log: Logger,
+): Promise<{ key: WalletKey; password: string; created: boolean } | null> {
+  try {
+    return await runCliOnboarding({ datadir: config.datadir });
+  } catch (error) {
+    if (error instanceof OnboardCancelledError) process.exit(0);
+    const message = (error as Error).message;
+    log.error(`Wallet setup failed: ${message}`);
+    console.error(`Wallet setup failed: ${message}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * One silent background update check per launch, keyed by mode so the notice
+ * wording matches the surface it is shown on (daemon log line / console
+ * message / TUI logs tab). Failures are swallowed: an offline or broken
+ * version source never blocks startup.
+ */
+function notifyUpdateOnce(log: Logger, mode: "tui" | "console" | "daemon", dev: boolean): void {
+  void checkAndClassify(dev).then((result) => {
+    const notice = modeUpdateNotice(mode, result);
+    if (notice) log.warn(notice);
+  });
+}
+
 async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
   const { config, warnings } = resolveConfig(paths);
   mkdirSync(config.datadir, { recursive: true });
@@ -179,13 +187,29 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
   let password: string | undefined;
   let created = false;
   if (!hasWalletFile(config.datadir)) {
-    if (!tui || !interactiveTerminal) {
-      console.error(`Wallet not initialized: ${vaultFilePath(config.datadir)} missing`);
+    // A startup password supplied on the command line or via the environment
+    // means the caller expects an existing wallet (scripted/service start);
+    // in that case do not prompt - fail with a clear init hint instead.
+    const scripted = paths.password !== undefined || process.env.EDX_WALLET_PASSWORD !== undefined;
+    if (tui && interactiveTerminal) {
+      const result = await runOnboarding(config, log);
+      key = result.key;
+      created = result.created;
+    } else if (process.stdin.isTTY && interactiveTerminal && !scripted) {
+      // Console/daemon interactive first run: text-mode onboarding. When the
+      // run is non-interactive runCliOnboardingSafe returns null below.
+      const onboarded = await runCliOnboardingSafe(config, log);
+      if (onboarded === null) {
+        console.error(`Wallet not initialized: ${vaultFilePath(config.datadir)} missing; run \`edgex-wallet init\` first`);
+        process.exit(1);
+      }
+      key = onboarded.key;
+      password = onboarded.password;
+      created = onboarded.created;
+    } else {
+      console.error(`Wallet not initialized: ${vaultFilePath(config.datadir)} missing; run \`edgex-wallet init\` first`);
       process.exit(1);
     }
-    const result = await runOnboarding(config, log);
-    key = result.key;
-    created = result.created;
   } else {
     const loaded = await loadExistingWallet(config, log, { password: paths.password });
     key = loaded.key;
@@ -221,15 +245,23 @@ async function startWallet(paths: CliPaths, tui: boolean): Promise<void> {
   process.on("SIGTERM", exit);
 
   if (!tui || !interactiveTerminal) {
+    // daemon mode: one silent background update check, logged as a line.
+    notifyUpdateOnce(log, "daemon", Boolean(paths.dev));
     log.info(t("log.daemonRunning", { summary: serviceSummary(config), nodes: joinNodes(config.addnodes) }));
     return;
   }
 
   process.stdout.write("\x1b[2J\x1b[H");
-  const application = render(<App core={core} log={log} registry={registry} config={config} onExit={exit} />, {
-    exitOnCtrlC: false,
-  });
+  const application = render(
+    <App core={core} log={log} registry={registry} config={config} dev={Boolean(paths.dev)} onExit={exit} />,
+    {
+      exitOnCtrlC: false,
+    },
+  );
   log.info(t("log.tuiStarted", { summary: serviceSummary(config), nodes: joinNodes(config.addnodes) }));
+  // TUI mode: one silent background update check; the notice lands in the logs
+  // tab through the App's log sink.
+  notifyUpdateOnce(log, "tui", Boolean(paths.dev));
   core.bus.on("shutdown", () => application.unmount());
 }
 
@@ -243,11 +275,37 @@ async function startConsole(paths: CliPaths): Promise<void> {
   const log = new Logger({ console: false, file: path.join(config.datadir, "dexcoin.log") });
   warnings.forEach((warning) => log.warn(warning));
   if (!hasWalletFile(config.datadir)) {
-    console.error(`Wallet not initialized: ${vaultFilePath(config.datadir)} missing; run init first`);
+    const scripted = paths.password !== undefined || process.env.EDX_WALLET_PASSWORD !== undefined;
+    if (process.stdin.isTTY && process.stdout.isTTY && !scripted) {
+      // Interactive console first run: plain-text onboarding instead of a bare
+      // "run init first" error. A null result means the run is not interactive
+      // after all, or the user cancelled - fall through to the error path.
+      const onboarded = await runCliOnboardingSafe(config, log);
+      if (onboarded !== null) {
+        const result = onboarded;
+        await continueConsole(config, paths, log, result.key, result.password, result.created);
+        return;
+      }
+    }
+    console.error(`Wallet not initialized: ${vaultFilePath(config.datadir)} missing; run \`edgex-wallet init\` first`);
     process.exit(1);
   }
   const loaded = await loadExistingWallet(config, log, { password: paths.password });
-  const { core, registry, game } = buildServices(config, loaded.key, log, loaded.password);
+  await continueConsole(config, paths, log, loaded.key, loaded.password, false);
+}
+
+/** Shared console-session bring-up for an existing (or freshly onboarded)
+ *  wallet: build services, start them, then run the line session. */
+async function continueConsole(
+  config: WalletConfig,
+  paths: CliPaths,
+  log: Logger,
+  key: WalletKey,
+  password: string,
+  created: boolean,
+): Promise<void> {
+  if (created) log.warn(t("log.walletCreated", { address: key.address }));
+  const { core, registry, game } = buildServices(config, key, log, password);
   const rpc = startWalletRpc(config, core, log);
   try {
     await core.start();
@@ -274,10 +332,14 @@ async function startConsole(paths: CliPaths): Promise<void> {
     core,
     log,
     interactive: true,
-    password: loaded.password,
+    password,
     datadir: config.datadir,
+    dev: Boolean(paths.dev),
   };
   log.info(t("log.consoleStarted", { summary: serviceSummary(config) }));
+  // console mode: one silent background update check, presented through the
+  // session's log presenter.
+  notifyUpdateOnce(log, "console", Boolean(paths.dev));
   await runConsoleWithReadline(registry, commandContext, log, {
     write: (line) => console.log(line),
     prompt: "edx> ",
@@ -327,6 +389,22 @@ async function initWallet(paths: CliPaths, args: string[]): Promise<void> {
   console.log(`Address: ${key.address}\nDerivation path: ${key.derivationPath}\nWallet file: ${vaultFilePath(config.datadir)}`);
 }
 
+/**
+ * One-shot `edgex-wallet update`: check for an update and apply it.
+ * Deliberately does not require a wallet - updating the program is unrelated
+ * to wallet data and must work before `init` has ever run. The installer is
+ * re-run in the background for installer-managed builds; otherwise the release
+ * page is printed for a manual download.
+ */
+async function runUpdateOneShot(paths: CliPaths): Promise<void> {
+  const outcome = await applyUpdate({ dev: Boolean(paths.dev), cwd: process.cwd() });
+  console.log(outcome.text);
+  if (outcome.installing) {
+    // Give the background installer a moment to detach, then leave.
+    setTimeout(() => process.exit(0), 500);
+  }
+}
+
 async function runOneShot(command: string, args: string[], paths: CliPaths): Promise<void> {
   const { config, warnings } = resolveConfig(paths);
   initGlobalData();
@@ -365,6 +443,9 @@ async function main(): Promise<void> {
   if (command === "daemon") return startWallet(paths, false);
   if (command === "console" || command === "cli") return startConsole(paths);
   if (command === "init") return initWallet(paths, args);
+  // update/upgrade never need a wallet: dispatch before the one-shot wallet
+  // guard so an uninitialized data directory can still update the program.
+  if (command === "update" || command === "upgrade") return runUpdateOneShot(paths);
   return runOneShot(command, args, paths);
 }
 

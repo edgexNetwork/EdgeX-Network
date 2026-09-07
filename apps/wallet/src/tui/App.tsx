@@ -126,10 +126,12 @@ export interface AppProps {
   log: Logger;
   registry: CommandRegistry;
   config: WalletConfig;
+  /** Development mode (-dev): update checks read a local version file. */
+  dev?: boolean;
   onExit: () => void;
 }
 
-export function App({ core, log, registry, config, onExit }: AppProps) {
+export function App({ core, log, registry, config, dev, onExit }: AppProps) {
   const { stdout } = useStdout();
   const cols = Math.max(40, stdout.columns ?? 80);
   const rows = Math.max(12, stdout.rows ?? 24);
@@ -691,7 +693,7 @@ export function App({ core, log, registry, config, onExit }: AppProps) {
     setScroll(0);
 
     void registry
-      .execute(line, { core, log, interactive: false, ask, datadir: config.datadir })
+      .execute(line, { core, log, interactive: false, ask, datadir: config.datadir, dev: Boolean(dev) })
       .then((out) => {
         if (out) {
           const lines = out.split("\n");

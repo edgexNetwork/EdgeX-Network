@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { PASSWORD_RETRY_LIMIT, withPasswordConfirm } from "./commands";
-import type { CommandContext } from "./registry";
-import { mkdtempSync } from "node:fs";
+import { PASSWORD_RETRY_LIMIT, withPasswordConfirm, builtinCommands } from "./commands";
+import { CommandRegistry, type CommandContext } from "./registry";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import process from "node:process";
 import { walletError, RPC_CODE } from "../core/errors";
+import { setLang, t } from "../i18n";
+import { VERSION } from "../updater/versionCheck";
 
 const silentLog = {
   debug() {},
@@ -103,5 +106,51 @@ describe("withPasswordConfirm", () => {
       datadir: mkdtempSync(join(tmpdir(), "edgex-cmd-")),
     };
     await expect(withPasswordConfirm(ctx, () => "never", "op")).rejects.toThrow(/requires interactive wallet-password confirmation/);
+  });
+});
+
+describe("update command", () => {
+  setLang("zh");
+
+  function makeRegistry(): CommandRegistry {
+    const registry = new CommandRegistry();
+    registry.registerAll(builtinCommands());
+    return registry;
+  }
+
+  test("reports up to date when dev mode has no local version file", async () => {
+    const registry = makeRegistry();
+    const output = await registry.execute("update", {
+      core: { requestStop: () => {} } as unknown as CommandContext["core"],
+      log: silentLog,
+      interactive: false,
+      dev: true,
+    });
+    expect(output).toContain(t("update.upToDate", { v: VERSION }));
+  });
+
+  test("reports an available update in dev mode from a local version file", async () => {
+    // Dev-mode updates read ./version from the working directory; point the
+    // process there for the duration of the test.
+    const dir = mkdtempSync(join(tmpdir(), "edgex-cmd-"));
+    const originalCwd = process.cwd();
+    try {
+      writeFileSync(join(dir, "version"), "9.9.9\n");
+      process.chdir(dir);
+      const registry = makeRegistry();
+      const output = await registry.execute("update", {
+        core: { requestStop: () => {} } as unknown as CommandContext["core"],
+        log: silentLog,
+        interactive: false,
+        dev: true,
+      });
+      // Not installed via the installer in this dev test run, so the release
+      // page download hint is expected rather than a background install.
+      expect(output).not.toContain(t("update.upToDate", { v: VERSION }));
+      expect(output).toContain("https://github.com/edgexNetwork/EdgeX-Network/releases");
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -18,6 +18,9 @@ export interface CommandContext {
   askSecret?: (prompt: string) => Promise<string>;
 
   datadir?: string;
+
+  /** Development mode (-dev): update checks read a local version file. */
+  dev?: boolean;
 }
 
 

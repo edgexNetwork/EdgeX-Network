@@ -31,7 +31,7 @@ describe("classifyUpdate", () => {
   test("no update when current equals or exceeds latest", () => {
     expect(classifyUpdate("1.0.0", "1.0.0").kind).toBe("none");
     expect(classifyUpdate("1.0.1", "1.0.0").kind).toBe("none");
-    expect(classifyUpdate("2.0.0", "1.9.9").kind).toBe("none");
+    expect(classifyUpdate("2.0.1", "1.9.9").kind).toBe("none");
   });
 
   test("minor update when the major matches and minor/patch is higher", () => {
@@ -40,7 +40,7 @@ describe("classifyUpdate", () => {
   });
 
   test("major update when the latest major is higher", () => {
-    expect(classifyUpdate("1.5.0", "2.0.0").kind).toBe("major");
+    expect(classifyUpdate("1.5.0", "2.0.1").kind).toBe("major");
   });
 
   test("failed parses never classify as an update", () => {
@@ -76,10 +76,10 @@ describe("fetchLatestVersion", () => {
   test("development mode reads the local version file", async () => {
     const dir = mkdtempSync(join(tmpdir(), "edgex-version-"));
     try {
-      writeFileSync(join(dir, LOCAL_VERSION_FILE), "2.0.0");
+      writeFileSync(join(dir, LOCAL_VERSION_FILE), "2.0.1");
       const latest = await fetchLatestVersion(true, nullVersionSource, dir);
       expect(latest).not.toBeNull();
-      expect(latest!.version).toBe("2.0.0");
+      expect(latest!.version).toBe("2.0.1");
       expect(latest!.url).toContain("github.com");
     } finally {
       rmSync(dir, { recursive: true, force: true });
